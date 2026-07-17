@@ -306,6 +306,7 @@ def _snapshot_reg_config(
     concurrency: int,
     stagger_ms: int,
     mail_provider: str | None = None,
+    mailbox_mode: str | None = None,
 ) -> dict[str, Any]:
     """Config snapshot kept with the in-memory/Redis batch while it is running."""
     return {
@@ -321,6 +322,7 @@ def _snapshot_reg_config(
         "stagger_ms": stagger_ms,
         "local_solver_url": "http://127.0.0.1:5072",
         "mail_provider": (mail_provider or "moemail").strip().lower() or "moemail",
+        "mailbox_mode": (mailbox_mode or "maindomain").strip().lower() or "maindomain",
     }
 
 
@@ -1045,21 +1047,29 @@ def _make_email_receiver(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mailbox_mode: str | None = None,
 ):
     from moemail import create_mailbox, fetch_messages, normalize_mail_provider
     from register_lite_config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
-    key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
-    prov = normalize_mail_provider(mail_provider, base_url=base)
-    # DuckMail public domains work without API key; others still require one.
-    if prov != "duckmail" and not key:
+    candidate_base = (base_url or MOEMAIL_BASE_URL or "").rstrip("/")
+    prov = normalize_mail_provider(mail_provider, base_url=candidate_base)
+    # Historical MOEMAIL_* fallbacks belong only to MoeMail. Reusing them for
+    # another provider can leak a MoeMail admin key in an unrelated auth header.
+    key = (api_key or (MOEMAIL_API_KEY if prov == "moemail" else "") or "").strip()
+    base = (
+        candidate_base
+        if base_url or prov == "moemail" or not (mail_provider or "").strip()
+        else ""
+    )
+    # DuckMail and TI Temp Mail can work without a create API key.
+    if prov not in {"duckmail", "ti-temp-mail"} and not key:
         raise ValueError(
             "Mail API key missing. Set GROK2API_MOEMAIL_API_KEY or pass api_key."
         )
-    # YYDS/GPTMail/CFMail/DuckMail: empty domain means provider-side auto/random pick.
+    # Non-MoeMail providers: empty domain means provider-side auto/random pick.
     # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-    if prov in {"yyds", "gptmail", "cfmail", "duckmail"}:
+    if prov in {"yyds", "gptmail", "cfmail", "duckmail", "ti-temp-mail"}:
         dom = _pick_domain_from_pool(domain)
     else:
         dom = _pick_domain_from_pool(domain) or (MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -1074,6 +1084,7 @@ def _make_email_receiver(
         expiry_ms=expiry_ms if expiry_ms is not None else MOEMAIL_EXPIRY_MS,
         api_key=key or None,
         base_url=base or None,
+        mailbox_mode=mailbox_mode,
     )
     email_id = mailbox["id"]
     address = mailbox["email"]
@@ -1101,6 +1112,8 @@ def _make_email_receiver(
                 default_base = "https://temp-email-api.awsl.uk"
             elif provider == "duckmail":
                 default_base = "https://api.duckmail.sbs"
+            elif provider == "ti-temp-mail":
+                default_base = "https://keldie.cyou"
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base
@@ -1290,6 +1303,7 @@ def _prepare_registration_session(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mailbox_mode: str | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -1307,6 +1321,7 @@ def _prepare_registration_session(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_provider,
+            mailbox_mode=mailbox_mode,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
@@ -1356,6 +1371,7 @@ def _start_one_registration(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mailbox_mode: str | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -1371,6 +1387,7 @@ def _start_one_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_provider,
+        mailbox_mode=mailbox_mode,
         batch_id=batch_id,
         batch_index=batch_index,
         batch_total=batch_total,
@@ -1435,6 +1452,7 @@ def start_registration(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mailbox_mode: str | None = None,
     count: int | None = None,
     concurrency: int | None = None,
     stagger_ms: int | None = None,
@@ -1592,6 +1610,7 @@ def start_registration(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_prov,
+            mailbox_mode=mailbox_mode,
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -1609,6 +1628,7 @@ def start_registration(
         concurrency=workers,
         stagger_ms=stagger,
         mail_provider=mail_prov,
+        mailbox_mode=mailbox_mode,
     )
     reg_cfg["proxy_strategy"] = proxy_strat
     reg_cfg["proxy_pool_count"] = len(proxy_pool)
@@ -1671,6 +1691,7 @@ def start_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_prov,
+        mailbox_mode=mailbox_mode,
     )
     if not started.get("ok"):
         return started
@@ -1718,6 +1739,7 @@ def _spawn_batch_runner(
     domain: str | None,
     expiry_ms: int | None,
     mail_provider: str | None = None,
+    mailbox_mode: str | None = None,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch (also used by resume/reclaim)."""
     bid = str(batch_id or "").strip()
@@ -1836,6 +1858,7 @@ def _spawn_batch_runner(
             concurrency=workers,
             stagger_ms=stagger,
             mail_provider=mail_provider,
+            mailbox_mode=mailbox_mode,
         )
         b["reg_config"]["proxy_strategy"] = proxy_strat
         b["reg_config"]["proxy_pool_count"] = len(proxy_pool)
@@ -1983,6 +2006,7 @@ def _spawn_batch_runner(
                 domain=domain,
                 expiry_ms=expiry_ms,
                 mail_provider=mail_provider,
+                mailbox_mode=mailbox_mode,
                 batch_id=bid,
                 batch_index=i,
                 batch_total=int((_load_reg_batch(bid) or {}).get("count") or remaining),
@@ -3554,6 +3578,7 @@ def resume_registration_batch(
         domain=cfg.get("domain"),
         expiry_ms=cfg.get("expiry_ms"),
         mail_provider=mail_provider,
+        mailbox_mode=cfg.get("mailbox_mode"),
     )
     out = {
         "ok": bool(spawned.get("ok")),

@@ -81,18 +81,25 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, Any] = {
     "base_url": os.getenv("GROK2API_MOEMAIL_BASE_URL", ""),
     "moemail_base_url": os.getenv("GROK2API_MOEMAIL_BASE_URL", ""),
     "cfmail_base_url": os.getenv("GROK2API_CFMAIL_BASE_URL", ""),
+    "ti_temp_mail_base_url": os.getenv(
+        "GROK2API_TI_TEMP_MAIL_BASE_URL", "https://keldie.cyou"
+    ),
     "api_key": os.getenv("GROK2API_MOEMAIL_API_KEY", ""),
     "moemail_api_key": os.getenv("GROK2API_MOEMAIL_API_KEY", ""),
     "yyds_api_key": os.getenv("GROK2API_YYDS_API_KEY", ""),
     "gptmail_api_key": os.getenv("GROK2API_GPTMAIL_API_KEY", ""),
     "cfmail_api_key": os.getenv("GROK2API_CFMAIL_API_KEY", ""),
     "duckmail_api_key": os.getenv("GROK2API_DUCKMAIL_API_KEY", ""),
+    "ti_temp_mail_api_key": os.getenv("GROK2API_TI_TEMP_MAIL_API_KEY", ""),
     "domain": os.getenv("GROK2API_MOEMAIL_DOMAIN", ""),
     "moemail_domain": os.getenv("GROK2API_MOEMAIL_DOMAIN", ""),
     "yyds_domain": os.getenv("GROK2API_YYDS_DOMAIN", ""),
     "gptmail_domain": os.getenv("GROK2API_GPTMAIL_DOMAIN", ""),
     "cfmail_domain": os.getenv("GROK2API_CFMAIL_DOMAIN", ""),
     "duckmail_domain": os.getenv("GROK2API_DUCKMAIL_DOMAIN", ""),
+    "ti_temp_mail_domain": os.getenv("GROK2API_TI_TEMP_MAIL_DOMAIN", ""),
+    "mailbox_mode": os.getenv("GROK2API_TI_TEMP_MAIL_MODE", "maindomain"),
+    "ti_temp_mail_mode": os.getenv("GROK2API_TI_TEMP_MAIL_MODE", "maindomain"),
     "captcha_provider": "local",
     "local_solver_url": "http://127.0.0.1:5072",
     "yescaptcha_key": "",
@@ -458,6 +465,7 @@ def _mail_provider_key_slot(provider: str) -> str:
         "gptmail": "gptmail_api_key",
         "cfmail": "cfmail_api_key",
         "duckmail": "duckmail_api_key",
+        "ti-temp-mail": "ti_temp_mail_api_key",
     }.get(provider, "moemail_api_key")
 
 
@@ -468,17 +476,33 @@ def _mail_provider_domain_slot(provider: str) -> str:
         "gptmail": "gptmail_domain",
         "cfmail": "cfmail_domain",
         "duckmail": "duckmail_domain",
+        "ti-temp-mail": "ti_temp_mail_domain",
     }.get(provider, "moemail_domain")
+
+
+def _mail_provider_base_url(cfg: dict[str, Any], provider: str) -> str:
+    if provider == "yyds":
+        return "https://maliapi.215.im"
+    if provider == "gptmail":
+        return "https://mail.chatgpt.org.uk"
+    if provider == "duckmail":
+        return "https://api.duckmail.sbs"
+    slot = {
+        "moemail": "moemail_base_url",
+        "cfmail": "cfmail_base_url",
+        "ti-temp-mail": "ti_temp_mail_base_url",
+    }.get(provider, "moemail_base_url")
+    return str(cfg.get(slot) or "").strip()
 
 
 def _configured_mail_providers(reg_cfg: dict[str, Any] | None = None) -> list[str]:
     cfg = reg_cfg if isinstance(reg_cfg, dict) else get_registration_config(include_secrets=True)
-    order = ["moemail", "yyds", "gptmail", "cfmail", "duckmail"]
+    order = ["moemail", "yyds", "gptmail", "cfmail", "duckmail", "ti-temp-mail"]
     out: list[str] = []
     for prov in order:
         key = str(cfg.get(_mail_provider_key_slot(prov)) or "").strip()
-        # DuckMail public domains work without API key.
-        if key or prov == "duckmail":
+        # DuckMail and TI Temp Mail can be deployed without a create API key.
+        if key or prov in {"duckmail", "ti-temp-mail"}:
             out.append(prov)
     # Always keep the active provider even if key temporarily empty (user may use env).
     active = str(cfg.get("mail_provider") or "moemail").strip().lower() or "moemail"
@@ -887,6 +911,11 @@ def rotate_registration_resources(
             # Switch unified domain/api_key view to the next provider's slots.
             reg_patch["domain"] = str(cfg.get(_mail_provider_domain_slot(nxt)) or "")
             reg_patch["api_key"] = str(cfg.get(_mail_provider_key_slot(nxt)) or "")
+            reg_patch["base_url"] = _mail_provider_base_url(cfg, nxt)
+            if nxt == "ti-temp-mail":
+                reg_patch["mailbox_mode"] = str(
+                    cfg.get("ti_temp_mail_mode") or "maindomain"
+                )
             actions.append(f"mail_provider→{nxt}")
         else:
             actions.append("mail_provider_single")
@@ -927,6 +956,7 @@ def resolve_schedule_registration_overrides() -> dict[str, Any]:
         "domain": domain or None,
         "expiry_ms": cfg.get("expiry_ms"),
         "mail_provider": str(cfg.get("mail_provider") or "moemail") or None,
+        "mailbox_mode": str(cfg.get("mailbox_mode") or "maindomain"),
         "captcha_provider": "local",
         "local_solver_url": str(cfg.get("local_solver_url") or "http://127.0.0.1:5072"),
         "yescaptcha_key": "",
@@ -1172,6 +1202,7 @@ def evaluate_schedule_tick(
                 proxy_strategy=overrides.get("proxy_strategy"),
                 domain=overrides.get("domain"),
                 mail_provider=overrides.get("mail_provider"),
+                mailbox_mode=overrides.get("mailbox_mode"),
                 moemail_api_key=overrides.get("moemail_api_key"),
                 moemail_base_url=overrides.get("moemail_base_url"),
                 stagger_ms=overrides.get("stagger_ms"),
@@ -1702,7 +1733,16 @@ def _normalize_domain_text(value: Any) -> str:
 def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     src = {**DEFAULT_REGISTRATION_CONFIG, **(raw or {})}
     mail = str(src.get("mail_provider") or "moemail").strip().lower()
-    if mail not in {"moemail", "yyds", "gptmail", "cfmail", "duckmail"}:
+    if mail in {"ti_temp_mail", "titempmail", "ti-temp", "keldie"}:
+        mail = "ti-temp-mail"
+    if mail not in {
+        "moemail",
+        "yyds",
+        "gptmail",
+        "cfmail",
+        "duckmail",
+        "ti-temp-mail",
+    }:
         mail = "moemail"
     # Local captcha only — YesCaptcha UI/config removed.
     captcha = "local"
@@ -1754,6 +1794,7 @@ def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         "gptmail": "gptmail_api_key",
         "cfmail": "cfmail_api_key",
         "duckmail": "duckmail_api_key",
+        "ti-temp-mail": "ti_temp_mail_api_key",
     }[mail]
     domain_slot = {
         "moemail": "moemail_domain",
@@ -1761,6 +1802,7 @@ def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         "gptmail": "gptmail_domain",
         "cfmail": "cfmail_domain",
         "duckmail": "duckmail_domain",
+        "ti-temp-mail": "ti_temp_mail_domain",
     }[mail]
     # Unified api_key is only a write alias for the active provider slot.
     # Never invent a key for provider B from a leftover unified api_key that
@@ -1781,6 +1823,19 @@ def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         cfg[domain_slot] = _normalize_domain_text(cfg.get("domain"))
     cfg["domain"] = _normalize_domain_text(cfg.get(domain_slot))
 
+    ti_mode = str(
+        cfg.get("mailbox_mode") or cfg.get("ti_temp_mail_mode") or "maindomain"
+    ).strip().lower()
+    if ti_mode not in {"maindomain", "subdomain"}:
+        ti_mode = "maindomain"
+    if mail == "ti-temp-mail" and "mailbox_mode" in (raw or {}):
+        cfg["ti_temp_mail_mode"] = ti_mode
+    saved_ti_mode = str(cfg.get("ti_temp_mail_mode") or ti_mode).strip().lower()
+    if saved_ti_mode not in {"maindomain", "subdomain"}:
+        saved_ti_mode = "maindomain"
+    cfg["ti_temp_mail_mode"] = saved_ti_mode
+    cfg["mailbox_mode"] = saved_ti_mode
+
     if mail == "yyds":
         cfg["base_url"] = "https://maliapi.215.im"
     elif mail == "gptmail":
@@ -1792,6 +1847,13 @@ def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
             cfg["cfmail_base_url"] = str(cfg.get("base_url") or "").strip().rstrip("/")
         cfg["base_url"] = str(cfg.get("cfmail_base_url") or "").strip().rstrip("/")
         cfg["cfmail_base_url"] = cfg["base_url"]
+    elif mail == "ti-temp-mail":
+        if cfg.get("base_url"):
+            cfg["ti_temp_mail_base_url"] = str(cfg.get("base_url") or "").strip().rstrip("/")
+        cfg["base_url"] = str(
+            cfg.get("ti_temp_mail_base_url") or "https://keldie.cyou"
+        ).strip().rstrip("/")
+        cfg["ti_temp_mail_base_url"] = cfg["base_url"]
     else:
         if cfg.get("base_url"):
             cfg["moemail_base_url"] = str(cfg.get("base_url") or "").strip().rstrip("/")
@@ -1842,7 +1904,15 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
     if include_secrets:
         return cfg
     public = dict(cfg)
-    for key in ("api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "proxy_password"):
+    for key in (
+        "api_key",
+        "moemail_api_key",
+        "yyds_api_key",
+        "gptmail_api_key",
+        "cfmail_api_key",
+        "ti_temp_mail_api_key",
+        "proxy_password",
+    ):
         public[f"{key}_set"] = bool(public.get(key))
         public[key] = "********" if public.get(key) else ""
     return public
@@ -1889,14 +1959,17 @@ _REG_EXPLICIT_EMPTY_KEYS = frozenset(
         "yyds_api_key",
         "gptmail_api_key",
         "cfmail_api_key",
+        "ti_temp_mail_api_key",
         "domain",
         "moemail_domain",
         "yyds_domain",
         "gptmail_domain",
         "cfmail_domain",
+        "ti_temp_mail_domain",
         "base_url",
         "moemail_base_url",
         "cfmail_base_url",
+        "ti_temp_mail_base_url",
         "proxy_password",
         "proxy",
         "proxy_username",

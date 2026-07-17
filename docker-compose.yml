@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${GROK_REGISTER_IMAGE:-grok-register-lite:local}
+    image: ${GROK_REGISTER_IMAGE:-ghcr.io/jackma15115/reg-g:latest}
     container_name: grok-register-lite
     env_file:
       - path: .env
@@ -45,6 +45,10 @@ services:
       GROK2API_MOEMAIL_API_KEY: "${GROK2API_MOEMAIL_API_KEY:-}"
       GROK2API_MOEMAIL_BASE_URL: "${GROK2API_MOEMAIL_BASE_URL:-}"
       GROK2API_MOEMAIL_DOMAIN: "${GROK2API_MOEMAIL_DOMAIN:-}"
+      GROK2API_TI_TEMP_MAIL_BASE_URL: "${GROK2API_TI_TEMP_MAIL_BASE_URL:-https://keldie.cyou}"
+      GROK2API_TI_TEMP_MAIL_API_KEY: "${GROK2API_TI_TEMP_MAIL_API_KEY:-}"
+      GROK2API_TI_TEMP_MAIL_DOMAIN: "${GROK2API_TI_TEMP_MAIL_DOMAIN:-}"
+      GROK2API_TI_TEMP_MAIL_MODE: "${GROK2API_TI_TEMP_MAIL_MODE:-maindomain}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8788${GROK_REGISTER_ADMIN_BASE_PATH:-/admin}/api/session"]

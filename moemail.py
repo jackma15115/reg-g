@@ -1,4 +1,4 @@
-"""Mail helpers (MoeMail / YYDS / GPTMail / CFMail / DuckMail) + proxy normalization.
+"""Mail helpers for supported inbox providers, plus proxy normalization.
 
 Kept intentionally small: only the pieces used by ``grok_build_adapter``
 (and optional admin proxy smoke tests). The legacy full-session
@@ -10,6 +10,7 @@ Providers:
   - gptmail  — mail.chatgpt.org.uk GPTMail (``/api/generate-email`` …)
   - cfmail   — dreamhunter2333/cloudflare_temp_email (``/api/new_address`` …)
   - duckmail — DuckMail public API (``https://api.duckmail.sbs``)
+  - ti-temp-mail — TI Temp Mail (``/mailbox`` + ``/messages``)
 """
 from __future__ import annotations
 
@@ -51,6 +52,9 @@ CFMAIL_DEFAULT_BASE_URL = "https://temp-email-api.awsl.uk"
 # DuckMail public API (docs: https://raw.githubusercontent.com/MoonWeSif/DuckMail/main/public/llm-api-docs.txt)
 DUCKMAIL_DEFAULT_BASE_URL = "https://api.duckmail.sbs"
 
+# TI Temp Mail API docs: https://keldie.cyou/
+TI_TEMP_MAIL_DEFAULT_BASE_URL = "https://keldie.cyou"
+
 
 def _headers(api_key: str | None = None) -> dict[str, str]:
     key = api_key or MOEMAIL_API_KEY
@@ -60,7 +64,7 @@ def _headers(api_key: str | None = None) -> dict[str, str]:
 
 
 def normalize_mail_provider(provider: str | None, *, base_url: str | None = None) -> str:
-    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``duckmail``.
+    """Return a canonical provider ID.
 
     Infer from base_url when provider is empty.
     """
@@ -98,6 +102,15 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         "duckmail.sbs",
     }:
         return "duckmail"
+    if p in {
+        "ti-temp-mail",
+        "ti_temp_mail",
+        "titempmail",
+        "ti-temp",
+        "keldie",
+        "keldie.cyou",
+    }:
+        return "ti-temp-mail"
     if p in {"moemail", "moe", "moe-mail"}:
         return "moemail"
     base = (base_url or "").strip().lower()
@@ -126,7 +139,27 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         return "cfmail"
     if any(x in base for x in ("duckmail.sbs", "api.duckmail", "duckmail")):
         return "duckmail"
+    if any(x in base for x in ("keldie.cyou", "ti-temp-mail", "ti_temp_mail")):
+        return "ti-temp-mail"
     return "moemail"
+
+
+def normalize_ti_temp_mail_base_url(base_url: str | None = None) -> str:
+    """Normalize a TI Temp Mail docs or endpoint URL to its API origin."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return TI_TEMP_MAIL_DEFAULT_BASE_URL
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    return origin or TI_TEMP_MAIL_DEFAULT_BASE_URL
+
+
+def normalize_ti_temp_mail_mode(mode: str | None = None) -> str:
+    """Return the API mailbox type: ``maindomain`` or ``subdomain``."""
+    value = (mode or "maindomain").strip().lower().replace("_", "").replace("-", "")
+    if value in {"subdomain", "sub", "wildcard"}:
+        return "subdomain"
+    return "maindomain"
 
 
 def normalize_yyds_base_url(base_url: str | None = None) -> str:
@@ -1636,6 +1669,149 @@ def duckmail_fetch_messages(
     return out
 
 
+def _ti_temp_mail_headers(
+    token: str | None = None,
+    *,
+    content_type: bool = False,
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if token:
+        # TI Temp Mail expects the raw token, without a Bearer prefix.
+        headers["Authorization"] = token.strip()
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def ti_temp_mail_create_mailbox(
+    *,
+    name: str | None = None,  # accepted for provider API compatibility
+    domain: str | None = None,
+    expiry_ms: int | None = None,  # provider controls retention
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+    mailbox_mode: str | None = None,
+) -> dict[str, Any]:
+    """Create a TI Temp Mail inbox in main-domain or subdomain mode."""
+    del name, expiry_ms, proxy, proxy_username, proxy_password
+    base = normalize_ti_temp_mail_base_url(base_url)
+    mode = normalize_ti_temp_mail_mode(mailbox_mode)
+    payload: dict[str, str] = {"type": mode}
+    domain_pool = [
+        part.strip().lstrip("@").strip(".").lower()
+        for part in re.split(r"[,;\s]+", domain or "")
+        if part.strip().lstrip("@").strip(".")
+    ]
+    dom = random.choice(domain_pool) if domain_pool else ""
+    if dom:
+        payload["domain"] = dom
+
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{base}/mailbox",
+            json=payload,
+            headers=_ti_temp_mail_headers(api_key, content_type=True),
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"TI Temp Mail create failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected TI Temp Mail create response: {data}")
+    token = str(data.get("token") or "").strip()
+    address = str(data.get("mailbox") or data.get("email") or "").strip()
+    if not token or not address or "@" not in address:
+        raise RuntimeError(f"Unexpected TI Temp Mail create response: {data}")
+    return {
+        "id": address,
+        "email": address,
+        "token": token,
+        "provider": "ti-temp-mail",
+        "mailbox_mode": mode,
+        "raw": data,
+    }
+
+
+def ti_temp_mail_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,  # create token is not used for mailbox reads
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """List TI Temp Mail messages and optionally expand each message body."""
+    del api_key
+    mailbox_token = (token or "").strip()
+    if not mailbox_token:
+        raise ValueError("TI Temp Mail mailbox token missing (returned by POST /mailbox).")
+    base = normalize_ti_temp_mail_base_url(base_url)
+    headers = _ti_temp_mail_headers(mailbox_token)
+
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(f"{base}/messages", headers=headers)
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"TI Temp Mail list messages failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+        messages = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(messages, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for item in messages[:20]:
+            if not isinstance(item, dict):
+                continue
+            msg_id = item.get("_id") or item.get("id")
+            row: dict[str, Any] = {
+                "id": str(msg_id or ""),
+                "subject": str(item.get("subject") or ""),
+                "from": str(item.get("from") or ""),
+                "to": str(item.get("to") or address or email_id or ""),
+                "created_at": item.get("receivedAt") or item.get("created_at"),
+                "text": str(item.get("bodyPreview") or ""),
+                "html": "",
+                "content": str(item.get("bodyPreview") or ""),
+                "attachments_count": int(item.get("attachmentsCount") or 0),
+            }
+            if include_details and msg_id:
+                try:
+                    detail = client.get(
+                        f"{base}/messages/{quote(str(msg_id), safe='')}",
+                        headers=headers,
+                    )
+                    if detail.status_code < 400:
+                        body = detail.json() if detail.content else {}
+                        if isinstance(body, dict):
+                            preview = str(body.get("bodyPreview") or row["text"] or "")
+                            html = str(body.get("bodyHtml") or "")
+                            row["text"] = preview
+                            row["html"] = html
+                            row["content"] = preview or html
+                            row["subject"] = str(body.get("subject") or row["subject"])
+                            row["from"] = str(body.get("from") or row["from"])
+                            row["attachments"] = body.get("attachments") or []
+                            row["attachments_count"] = int(
+                                body.get("attachmentsCount") or row["attachments_count"]
+                            )
+                except Exception:
+                    pass
+            text_blob = "\n".join(
+                str(row.get(k) or "")
+                for k in ("subject", "text", "html", "content", "from")
+            )
+            row["extracted"] = _extract_codes_and_links(text_blob)
+            out.append(row)
+    return out
+
+
 def create_mailbox(
     *,
     provider: str | None = None,
@@ -1647,8 +1823,9 @@ def create_mailbox(
     proxy: str | None = None,
     proxy_username: str | None = None,
     proxy_password: str | None = None,
+    mailbox_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``duckmail``)."""
+    """Create a mailbox using the selected provider."""
     prov = normalize_mail_provider(provider, base_url=base_url)
     if prov == "yyds":
         return yyds_create_mailbox(
@@ -1693,6 +1870,18 @@ def create_mailbox(
             proxy=proxy,
             proxy_username=proxy_username,
             proxy_password=proxy_password,
+        )
+    if prov == "ti-temp-mail":
+        return ti_temp_mail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+            mailbox_mode=mailbox_mode,
         )
     box = moemail_create_mailbox(
         name=name,
@@ -1750,6 +1939,15 @@ def fetch_messages(
         )
     if prov == "duckmail":
         return duckmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
+    if prov == "ti-temp-mail":
+        return ti_temp_mail_fetch_messages(
             email_id,
             api_key=api_key,
             base_url=base_url,

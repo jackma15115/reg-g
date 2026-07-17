@@ -1356,6 +1356,7 @@
                     <option value="gptmail">GPTMail</option>
                     <option value="cfmail">Cloudflare Temp Email</option>
                     <option value="duckmail">DuckMail</option>
+                    <option value="ti-temp-mail">ti-temp-mail</option>
                   </select>
                 </div>
                 <div class="mail-field" data-mail-field="base_url">
@@ -1372,6 +1373,14 @@
                   <label id="domain_label" for="domain">域名</label>
                   <input id="domain" placeholder="留空则自动获取" spellcheck="false" />
                   <div id="domain_note" class="field-note" style="display:none"></div>
+                </div>
+                <div class="mail-field" data-mail-field="mailbox_mode">
+                  <label for="mailbox_mode">邮箱模式</label>
+                  <select id="mailbox_mode">
+                    <option value="maindomain">主域名</option>
+                    <option value="subdomain">子域名（泛域名）</option>
+                  </select>
+                  <div class="field-note">对应 API 的 maindomain / subdomain</div>
                 </div>
                 <div class="mail-field" data-mail-field="expiry_ms">
                   <label for="expiry_ms">邮箱有效期</label>
@@ -2681,6 +2690,9 @@
         payload.base_url = value("base_url").trim();
         payload.api_key = value("api_key").trim();
         payload.domain = value("domain").trim();
+        if (mail === "ti-temp-mail") {
+          payload.mailbox_mode = value("mailbox_mode") || "maindomain";
+        }
         if (mail === "moemail" || mail === "cfmail") {
           payload.expiry_ms = numberValue("expiry_ms", 3600000);
         }
@@ -2704,13 +2716,18 @@
           payload.duckmail_api_key = payload.api_key;
           payload.duckmail_domain = payload.domain;
           payload.base_url = "https://api.duckmail.sbs";
+        } else if (mail === "ti-temp-mail") {
+          payload.ti_temp_mail_base_url = payload.base_url;
+          payload.ti_temp_mail_api_key = payload.api_key;
+          payload.ti_temp_mail_domain = payload.domain;
+          payload.ti_temp_mail_mode = payload.mailbox_mode;
         }
         return payload;
       }
 
       function currentMailProvider() {
         var mail = value("mail_provider") || "moemail";
-        if (["moemail", "yyds", "gptmail", "cfmail", "duckmail"].indexOf(mail) < 0) mail = "moemail";
+        if (["moemail", "yyds", "gptmail", "cfmail", "duckmail", "ti-temp-mail"].indexOf(mail) < 0) mail = "moemail";
         return mail;
       }
 
@@ -2785,6 +2802,21 @@
             domain_label: "域名",
             domain_placeholder: "留空则自动获取公开域名",
             domain_note: "可填多个，逗号分隔；留空自动从 GET /domains 随机"
+          },
+          "ti-temp-mail": {
+            base_url: true,
+            api_key: true,
+            domain: true,
+            expiry_ms: false,
+            mailbox_mode: true,
+            base_url_label: "TI Temp Mail 服务地址",
+            base_url_placeholder: "https://keldie.cyou",
+            base_url_note: "默认使用 keldie.cyou，也支持同协议自托管服务",
+            api_key_label: "创建 Token（可选）",
+            api_key_note: "服务端设置 CREATE_TOKEN 时填写；Authorization 使用原始 token",
+            domain_label: "邮箱域名",
+            domain_placeholder: "留空则由服务端随机选择",
+            domain_note: "主域名和子域名模式都支持，可填多个域名供注册任务轮换"
           }
         };
         return map[provider] || map.moemail;
@@ -2797,7 +2829,8 @@
         yyds: {base_url: "https://maliapi.215.im", api_key: "", domain: ""},
         gptmail: {base_url: "https://mail.chatgpt.org.uk", api_key: "", domain: ""},
         cfmail: {base_url: "", api_key: "", domain: ""},
-        duckmail: {base_url: "https://api.duckmail.sbs", api_key: "", domain: ""}
+        duckmail: {base_url: "https://api.duckmail.sbs", api_key: "", domain: ""},
+        "ti-temp-mail": {base_url: "https://keldie.cyou", api_key: "", domain: "", mailbox_mode: "maindomain"}
       };
       var activeMailProvider = "moemail";
 
@@ -2809,6 +2842,7 @@
         mailProviderDraft[mail].base_url = value("base_url").trim();
         mailProviderDraft[mail].api_key = value("api_key");
         mailProviderDraft[mail].domain = value("domain").trim();
+        mailProviderDraft[mail].mailbox_mode = value("mailbox_mode") || "maindomain";
       }
 
       function restoreMailProviderDraft(provider) {
@@ -2825,6 +2859,7 @@
         }
         setValue("api_key", draft.api_key || "");
         setValue("domain", draft.domain || "");
+        setValue("mailbox_mode", draft.mailbox_mode || "maindomain");
         activeMailProvider = mail;
       }
 
@@ -2870,7 +2905,7 @@
       function applyRegistrationConfig(cfg) {
         cfg = cfg || {};
         var mail = cfg.mail_provider || "moemail";
-        if (["moemail", "yyds", "gptmail", "cfmail", "duckmail"].indexOf(mail) < 0) mail = "moemail";
+        if (["moemail", "yyds", "gptmail", "cfmail", "duckmail", "ti-temp-mail"].indexOf(mail) < 0) mail = "moemail";
 
         // Seed per-provider drafts from saved backend slots so a switch can
         // restore the right key/domain instead of keeping the previous one.
@@ -2899,6 +2934,12 @@
           api_key: cfg.duckmail_api_key || "",
           domain: cfg.duckmail_domain || ""
         };
+        mailProviderDraft["ti-temp-mail"] = {
+          base_url: cfg.ti_temp_mail_base_url || "https://keldie.cyou",
+          api_key: cfg.ti_temp_mail_api_key || "",
+          domain: cfg.ti_temp_mail_domain || "",
+          mailbox_mode: cfg.ti_temp_mail_mode || cfg.mailbox_mode || "maindomain"
+        };
 
         // Active provider may still only have the unified api_key/domain slots.
         if (mail === "moemail") {
@@ -2918,6 +2959,11 @@
         } else if (mail === "duckmail") {
           if (!mailProviderDraft.duckmail.api_key && cfg.api_key) mailProviderDraft.duckmail.api_key = cfg.api_key;
           if (!mailProviderDraft.duckmail.domain && cfg.domain) mailProviderDraft.duckmail.domain = cfg.domain;
+        } else if (mail === "ti-temp-mail") {
+          if (!mailProviderDraft["ti-temp-mail"].api_key && cfg.api_key) mailProviderDraft["ti-temp-mail"].api_key = cfg.api_key;
+          if (!mailProviderDraft["ti-temp-mail"].domain && cfg.domain) mailProviderDraft["ti-temp-mail"].domain = cfg.domain;
+          if (!mailProviderDraft["ti-temp-mail"].base_url && cfg.base_url) mailProviderDraft["ti-temp-mail"].base_url = cfg.base_url;
+          mailProviderDraft["ti-temp-mail"].mailbox_mode = cfg.mailbox_mode || cfg.ti_temp_mail_mode || "maindomain";
         }
 
         setValue("mail_provider", mail);

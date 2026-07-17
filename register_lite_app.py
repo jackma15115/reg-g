@@ -340,11 +340,15 @@ class RegistrationBody(BaseModel):
     gptmail_api_key: str | None = None
     cfmail_api_key: str | None = None
     duckmail_api_key: str | None = None
+    ti_temp_mail_api_key: str | None = None
     moemail_domain: str | None = None
     yyds_domain: str | None = None
     gptmail_domain: str | None = None
     cfmail_domain: str | None = None
     duckmail_domain: str | None = None
+    ti_temp_mail_domain: str | None = None
+    mailbox_mode: str | None = None
+    ti_temp_mail_mode: str | None = None
     captcha_provider: str | None = None
     local_solver_url: str | None = None
     yescaptcha_key: str | None = None
@@ -352,6 +356,7 @@ class RegistrationBody(BaseModel):
     moemail_base_url: str | None = None
     cfmail_base_url: str | None = None
     duckmail_base_url: str | None = None
+    ti_temp_mail_base_url: str | None = None
     proxy: str | None = None
     proxy_username: str | None = None
     proxy_password: str | None = None
@@ -711,6 +716,7 @@ def _start_scheduled_registration(**kwargs: Any) -> dict[str, Any]:
         "domain",
         "expiry_ms",
         "mail_provider",
+        "mailbox_mode",
         "captcha_provider",
         "local_solver_url",
         "yescaptcha_key",
@@ -1587,6 +1593,34 @@ def _check_registration_inputs(resolved: dict[str, Any]) -> dict[str, Any]:
                     )
             except Exception as e:  # noqa: BLE001
                 add("邮箱服务", False, f"Cloudflare Temp Email 不可用：{e}")
+    elif mail == "ti-temp-mail":
+        if not base:
+            add("邮箱服务", False, "TI Temp Mail 缺少服务地址")
+        else:
+            try:
+                mode = str(resolved.get("mailbox_mode") or "maindomain")
+                box = create_mailbox(
+                    provider="ti-temp-mail",
+                    api_key=api_key or None,
+                    base_url=base,
+                    domain=domain or None,
+                    mailbox_mode=mode,
+                )
+                addr = str(box.get("email") or "")
+                add(
+                    "邮箱服务",
+                    bool(addr and "@" in addr),
+                    f"TI Temp Mail 可用，已用 {mode} 模式创建 {addr}"
+                    if addr
+                    else "TI Temp Mail 返回异常",
+                    {
+                        "provider": "ti-temp-mail",
+                        "email": addr,
+                        "mailbox_mode": box.get("mailbox_mode") or mode,
+                    },
+                )
+            except Exception as e:  # noqa: BLE001
+                add("邮箱服务", False, f"TI Temp Mail 不可用：{e}")
     elif mail == "duckmail":
         # Public domains work without API key; private domains need dk_ key.
         try:
@@ -2623,7 +2657,7 @@ async def get_registration_config():
 
 @app.put(_admin_path('api', 'accounts', 'register-email', 'config'))
 async def put_registration_config(body: RegistrationBody):
-    cfg = lite_store.set_registration_config(body.model_dump(exclude_none=False), replace=False)
+    cfg = lite_store.set_registration_config(body.model_dump(exclude_none=True), replace=False)
     # Manual save re-anchors schedule recover baseline to the values the user just chose.
     try:
         lite_store.refresh_schedule_baseline_from_config(cfg)
@@ -2723,6 +2757,7 @@ async def start_registration(body: RegistrationBody):
         domain=resolved.get("domain") or None,
         expiry_ms=resolved.get("expiry_ms"),
         mail_provider=resolved.get("mail_provider") or None,
+        mailbox_mode=resolved.get("mailbox_mode") or None,
         captcha_provider="local",
         local_solver_url=resolved.get("local_solver_url") or LOCAL_SOLVER_URL,
         yescaptcha_key="",
