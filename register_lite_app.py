@@ -1972,6 +1972,43 @@ def _wait_solver_ready(*, timeout_sec: float = 25.0, want_thread: int | None = N
     return last
 
 
+def _relay_local_solver_output(proc: subprocess.Popen, log_file: Path) -> None:
+    """Copy a managed solver's output to its file and the container stdout."""
+    stream = proc.stdout
+    if stream is None:
+        return
+
+    def relay() -> None:
+        log_handle = None
+        try:
+            log_handle = open(log_file, "a", encoding="utf-8", buffering=1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[register-lite] cannot open solver log file {log_file}: {exc}", flush=True)
+        try:
+            for line in stream:
+                if log_handle is not None:
+                    log_handle.write(line)
+                print(line, end="", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[register-lite] solver log relay stopped: {exc}", flush=True)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+            if log_handle is not None:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
+
+    threading.Thread(
+        target=relay,
+        name=f"turnstile-log-{proc.pid}",
+        daemon=True,
+    ).start()
+
+
 def _ensure_solver_threads(captcha_concurrency: int | None, *, force_restart: bool = False) -> dict[str, Any]:
     """Hot-apply captcha browser pool size to N.
 
@@ -2124,7 +2161,6 @@ def _start_local_solver(thread: int = 1, browser_type: str = "camoufox", force: 
             time.sleep(0.3)
         except Exception:
             pass
-    out = open(log_file, "ab", buffering=0)
     _local_solver_proc = subprocess.Popen(
         [
             str(py),
@@ -2140,8 +2176,12 @@ def _start_local_solver(thread: int = 1, browser_type: str = "camoufox", force: 
             str(LOCAL_SOLVER_PORT),
         ],
         cwd=str(solver_dir),
-        stdout=out,
+        stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
         start_new_session=True,
         env={
             **os.environ,
@@ -2154,6 +2194,12 @@ def _start_local_solver(thread: int = 1, browser_type: str = "camoufox", force: 
                 / "ms-playwright"
             ),
         },
+    )
+    _relay_local_solver_output(_local_solver_proc, log_file)
+    print(
+        f"[register-lite] solver process started pid={_local_solver_proc.pid} "
+        f"thread={workers} browser={browser} log={log_file}",
+        flush=True,
     )
     return {
         "ok": True,

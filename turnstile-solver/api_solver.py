@@ -3,8 +3,14 @@ import sys
 import time
 import uuid
 import random
+import json
 import logging
 import asyncio
+import platform
+import shutil
+import subprocess
+from importlib import metadata as importlib_metadata
+from pathlib import Path
 from typing import Optional, Union
 from urllib.parse import unquote, urlparse
 import argparse
@@ -76,6 +82,122 @@ def _proxy_from_task_fields(task: dict) -> Optional[str]:
             return f"{scheme}://{auth}{address}:{port}"
         return f"{scheme}://{address}:{port}"
     return None
+
+
+def _package_version(name: str) -> Optional[str]:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _elf_machine(path: Path) -> Optional[str]:
+    """Return the ELF machine name without invoking the executable."""
+    try:
+        with path.open("rb") as executable:
+            header = executable.read(20)
+        if len(header) < 20 or header[:4] != b"\x7fELF":
+            return None
+        byteorder = "little" if header[5] == 1 else "big"
+        machine = int.from_bytes(header[18:20], byteorder=byteorder)
+        return {
+            0x03: "x86",
+            0x28: "ARM",
+            0x3E: "x86_64",
+            0xB7: "AArch64",
+        }.get(machine, f"ELF_machine_{machine}")
+    except Exception:
+        return None
+
+
+def _find_camoufox_executable(install_dir: Path) -> Optional[Path]:
+    names = ("camoufox", "firefox", "camoufox-bin", "firefox-bin")
+    for name in names:
+        direct = install_dir / name
+        if direct.is_file():
+            return direct
+    try:
+        for name in names:
+            for candidate in install_dir.rglob(name):
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return candidate
+    except Exception:
+        return None
+    return None
+
+
+def _collect_runtime_diagnostics(browser_type: str) -> dict:
+    """Collect non-sensitive browser/architecture details for ARM diagnostics."""
+    info = {
+        "hostname": platform.node() or None,
+        "platform": platform.platform(),
+        "machine": platform.machine() or None,
+        "python": platform.python_version(),
+        "python_executable": sys.executable,
+        "browser_type": browser_type,
+        "xdg_cache_home": os.getenv("XDG_CACHE_HOME"),
+        "playwright_browsers_path": os.getenv("PLAYWRIGHT_BROWSERS_PATH"),
+        "camoufox_package": _package_version("camoufox"),
+        "patchright_package": _package_version("patchright"),
+    }
+    if browser_type != "camoufox":
+        return info
+
+    try:
+        from camoufox.pkgman import INSTALL_DIR, installed_verstr
+
+        install_dir = Path(INSTALL_DIR)
+        info["camoufox_install_dir"] = str(install_dir)
+        info["camoufox_install_dir_exists"] = install_dir.is_dir()
+        try:
+            info["camoufox_browser_version"] = installed_verstr()
+        except Exception as exc:
+            info["camoufox_browser_version_error"] = f"{type(exc).__name__}: {exc}"
+
+        executable = _find_camoufox_executable(install_dir)
+        info["camoufox_executable"] = str(executable) if executable else None
+        info["camoufox_executable_exists"] = bool(executable and executable.is_file())
+        if executable:
+            elf_machine = _elf_machine(executable)
+            info["camoufox_elf_machine"] = elf_machine
+            host_machine = (platform.machine() or "").lower()
+            expected = {
+                "aarch64": "AArch64",
+                "arm64": "AArch64",
+                "x86_64": "x86_64",
+                "amd64": "x86_64",
+            }.get(host_machine)
+            info["camoufox_arch_matches_host"] = (
+                elf_machine == expected if elf_machine and expected else None
+            )
+
+            ldd = shutil.which("ldd")
+            if ldd and elf_machine:
+                try:
+                    result = subprocess.run(
+                        [ldd, str(executable)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    output = result.stdout or ""
+                    info["ldd_exit_code"] = result.returncode
+                    info["missing_libraries"] = [
+                        line.split("=>", 1)[0].strip()
+                        for line in output.splitlines()
+                        if "not found" in line
+                    ]
+                    if result.returncode and not info["missing_libraries"]:
+                        info["ldd_error"] = " | ".join(output.strip().splitlines()[-3:])[:500]
+                except Exception as exc:
+                    info["ldd_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        info["camoufox_diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+    return info
 
 
 
@@ -152,6 +274,13 @@ class TurnstileAPIServer:
         self._last_used = 0.0
         self._idle_task: Optional[asyncio.Task] = None
         self._in_flight = 0
+        self._runtime_info: dict = {}
+        self._browser_init_attempts = 0
+        self._browser_init_in_progress = False
+        self._browser_init_last_started_at: Optional[str] = None
+        self._browser_init_last_success_at: Optional[str] = None
+        self._browser_init_last_duration_sec: Optional[float] = None
+        self._browser_init_last_error: Optional[str] = None
 
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
@@ -231,6 +360,11 @@ class TurnstileAPIServer:
         """Boot HTTP + DB; optionally warm browsers (or wait for first task)."""
         self.display_welcome()
         self._pool_lock = asyncio.Lock()
+        self._runtime_info = _collect_runtime_diagnostics(self.browser_type)
+        logger.info(
+            "Runtime diagnostics: "
+            + json.dumps(self._runtime_info, ensure_ascii=True, sort_keys=True)
+        )
         try:
             await init_db()
             # Periodic result cleanup (independent of browsers)
@@ -245,7 +379,7 @@ class TurnstileAPIServer:
                     self._idle_task = asyncio.create_task(self._idle_reaper())
             else:
                 logger.info("Starting browser initialization (eager)")
-                await self._initialize_browser()
+                await self._initialize_browser_with_diagnostics("eager_startup")
                 self._pool_ready = True
                 self._last_used = time.time()
                 if self.idle_sec > 0:
@@ -253,6 +387,45 @@ class TurnstileAPIServer:
         except Exception as e:
             logger.error(f"Failed to start turnstile solver: {str(e)}")
             raise
+
+    async def _initialize_browser_with_diagnostics(self, trigger: str) -> None:
+        """Initialize browsers while retaining enough state to diagnose launch failures."""
+        self._browser_init_attempts += 1
+        attempt = self._browser_init_attempts
+        self._browser_init_in_progress = True
+        self._browser_init_last_started_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        self._browser_init_last_error = None
+        started = time.monotonic()
+        self._runtime_info = _collect_runtime_diagnostics(self.browser_type)
+        logger.info(
+            f"Browser initialization started attempt={attempt} trigger={trigger} "
+            f"runtime={json.dumps(self._runtime_info, ensure_ascii=True, sort_keys=True)}"
+        )
+        try:
+            await self._initialize_browser()
+        except Exception as exc:
+            self._pool_ready = False
+            self._browser_init_last_duration_sec = round(time.monotonic() - started, 3)
+            self._browser_init_last_error = f"{type(exc).__name__}: {exc}"[:1000]
+            logger.exception(
+                f"Browser initialization failed attempt={attempt} trigger={trigger} "
+                f"duration={self._browser_init_last_duration_sec}s"
+            )
+            raise
+        else:
+            self._browser_init_last_duration_sec = round(time.monotonic() - started, 3)
+            self._browser_init_last_success_at = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            logger.success(
+                f"Browser initialization succeeded attempt={attempt} trigger={trigger} "
+                f"duration={self._browser_init_last_duration_sec}s "
+                f"queue={self.browser_pool.qsize()}"
+            )
+        finally:
+            self._browser_init_in_progress = False
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
@@ -581,7 +754,7 @@ class TurnstileAPIServer:
             )
             if self._pool_ready or self._owned_browsers or self._playwright or self._camoufox:
                 await self._shutdown_browsers()
-            await self._initialize_browser()
+            await self._initialize_browser_with_diagnostics("first_task_or_rebuild")
 
     async def _idle_reaper(self) -> None:
         """Close browsers after TURNSTILE_IDLE_SEC with no captcha activity."""
@@ -1068,6 +1241,16 @@ class TurnstileAPIServer:
         browser_config = None
         acquired = False
         proxy = self._select_proxy(proxy)
+        task_ref = task_id[:8]
+        try:
+            target_host = urlparse(url).hostname or "unknown"
+        except Exception:
+            target_host = "unknown"
+        logger.info(
+            f"Turnstile task started id={task_ref} host={target_host} "
+            f"browser={self.browser_type} machine={platform.machine() or 'unknown'} "
+            f"proxy={'yes' if proxy else 'no'} pool_ready={self._pool_ready}"
+        )
 
         # Mark in-flight before warm-up so the idle reaper cannot reclaim mid-acquire.
         # Always pair with the outer finally decrement — never leave this sticky.
@@ -1079,8 +1262,15 @@ class TurnstileAPIServer:
                 index, browser, browser_config = await self.browser_pool.get()
                 acquired = True
                 self._last_used = time.time()
+                logger.info(
+                    f"Turnstile task acquired browser id={task_ref} browser_index={index} "
+                    f"queue_remaining={self.browser_pool.qsize()}"
+                )
             except Exception as e:
-                logger.error(f"Failed to acquire browser from pool: {e}")
+                logger.exception(
+                    f"Turnstile task browser acquire failed id={task_ref} "
+                    f"elapsed={round(time.time() - start_time, 3)}s: {e}"
+                )
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": str(e)})
                 return
 
@@ -1108,6 +1298,10 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Creating context without proxy")
 
             context_options = self._build_context_options(browser_config or {}, proxy)
+            logger.info(
+                f"Turnstile context creation started id={task_ref} browser_index={index} "
+                f"proxy={'yes' if proxy else 'no'}"
+            )
             try:
                 context = await browser.new_context(**context_options)
             except Exception as ctx_err:
@@ -1138,8 +1332,14 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
                 context = await browser.new_context(no_viewport=True)
+            logger.info(
+                f"Turnstile context created id={task_ref} browser_index={index}"
+            )
 
             page = await context.new_page()
+            logger.info(
+                f"Turnstile page created id={task_ref} browser_index={index}"
+            )
 
             try:
                 await page.set_viewport_size({"width": 500, "height": 100})
@@ -1162,17 +1362,26 @@ class TurnstileAPIServer:
 
             try:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
+                    logger.debug(
+                        f"Browser {index}: Starting Turnstile solve task={task_ref} "
+                        f"host={target_host} proxy={'yes' if proxy else 'no'}"
+                    )
                     logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
-                    logger.debug(f"Browser {index}: Loading real website directly: {url}")
+                    logger.debug(f"Browser {index}: Loading target host: {target_host}")
 
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                logger.info(
+                    f"Turnstile page loaded id={task_ref} browser_index={index} host={target_host}"
+                )
                 await self._unblock_rendering(page)
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+                logger.info(
+                    f"Turnstile widget injected id={task_ref} browser_index={index}; waiting for token"
+                )
                 await asyncio.sleep(3)
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
@@ -1197,7 +1406,10 @@ class TurnstileAPIServer:
                                 token = await locator.input_value(timeout=500)
                                 if token:
                                     elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    logger.success(
+                                        f"Turnstile task solved id={task_ref} browser_index={index} "
+                                        f"elapsed={elapsed_time}s"
+                                    )
                                     await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                                     return
                             except Exception as e:
@@ -1211,7 +1423,10 @@ class TurnstileAPIServer:
                                     element_token = await locator.nth(i).input_value(timeout=500)
                                     if element_token:
                                         elapsed_time = round(time.time() - start_time, 3)
-                                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                        logger.success(
+                                            f"Turnstile task solved id={task_ref} browser_index={index} "
+                                            f"elapsed={elapsed_time}s"
+                                        )
                                         await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
                                         return
                                 except Exception as e:
@@ -1240,12 +1455,17 @@ class TurnstileAPIServer:
 
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
-                if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                logger.error(
+                    f"Turnstile task timed out id={task_ref} browser_index={index} "
+                    f"elapsed={elapsed_time}s"
+                )
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
-                logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
+                logger.exception(
+                    f"Turnstile task failed id={task_ref} browser_index={index} "
+                    f"elapsed={elapsed_time}s: {e}"
+                )
             finally:
                 if self.debug:
                     logger.debug(f"Browser {index}: Closing browser context and cleaning up")
@@ -1317,6 +1537,10 @@ class TurnstileAPIServer:
             }
 
         task_id = str(uuid.uuid4())
+        try:
+            target_host = urlparse(url).hostname or "unknown"
+        except Exception:
+            target_host = "unknown"
         await save_result(task_id, "turnstile", {
             "status": "CAPTCHA_NOT_READY",
             "createTime": int(time.time()),
@@ -1326,6 +1550,11 @@ class TurnstileAPIServer:
             "cdata": cdata,
             "proxy": bool(_normalize_task_proxy(proxy)),
         })
+        logger.info(
+            f"Turnstile task queued id={task_id[:8]} host={target_host} "
+            f"browser={self.browser_type} machine={platform.machine() or 'unknown'} "
+            f"proxy={'yes' if _normalize_task_proxy(proxy) else 'no'}"
+        )
 
         try:
             asyncio.create_task(
@@ -1511,6 +1740,15 @@ class TurnstileAPIServer:
             "in_flight": int(self._in_flight or 0),
             "idle_for_sec": idle_for,
             "zombies": self._count_zombie_processes(),
+            "browser_init": {
+                "attempts": self._browser_init_attempts,
+                "in_progress": self._browser_init_in_progress,
+                "last_started_at": self._browser_init_last_started_at,
+                "last_success_at": self._browser_init_last_success_at,
+                "last_duration_sec": self._browser_init_last_duration_sec,
+                "last_error": self._browser_init_last_error,
+            },
+            "runtime": self._runtime_info,
         }), 200
 
     async def reclaim(self):

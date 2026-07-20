@@ -74,6 +74,10 @@ else
   mkdir -p "${XDG_CACHE_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"
 fi
 echo "[entrypoint] browser cache=${XDG_CACHE_HOME}"
+os_arch="$(uname -m 2>/dev/null || echo unknown)"
+debian_arch="$(dpkg --print-architecture 2>/dev/null || echo unknown)"
+python_runtime="$(python -c 'import platform,struct; print(f"{platform.python_version()} machine={platform.machine()} bits={struct.calcsize(chr(80))*8}")' 2>/dev/null || echo unknown)"
+echo "[entrypoint] runtime uname=${os_arch} debian_arch=${debian_arch} python=${python_runtime}"
 
 # Refuse to run if /data is not writable (would silently lose data on ephemeral FS)
 if ! touch "${GROK_REGISTER_LITE_DATA_DIR}/.write_test" 2>/dev/null; then
@@ -104,6 +108,8 @@ ensure_browsers() {
 }
 
 start_inline_solver() {
+  local solver_log="/app/turnstile-solver/logs/turnstile_solver.log"
+  local health_json=""
   if [[ ! -f /app/turnstile-solver/api_solver.py ]]; then
     echo "[entrypoint] turnstile-solver missing; skip inline solver"
     return 0
@@ -137,20 +143,23 @@ start_inline_solver() {
       --host "${solver_host}" \
       --port "${solver_port}" \
       --debug
-  ) > /app/turnstile-solver/logs/turnstile_solver.log 2>&1 &
+  ) > >(tee -a "${solver_log}") 2>&1 &
   solver_pid=$!
   echo "${solver_pid}" > /app/turnstile-solver/logs/turnstile_solver.pid
   echo "[entrypoint] inline solver pid=${solver_pid}"
 
   for i in $(seq 1 120); do
-    if curl -fsS -m 1 "http://127.0.0.1:${solver_port}/health" >/dev/null 2>&1 \
-      || curl -fsS -m 1 "http://127.0.0.1:${solver_port}/" >/dev/null 2>&1; then
-      echo "[entrypoint] inline solver ready"
+    if health_json="$(curl -fsS -m 1 "http://127.0.0.1:${solver_port}/health" 2>/dev/null)"; then
+      echo "[entrypoint] inline solver HTTP ready health=${health_json}"
+      return 0
+    fi
+    if curl -fsS -m 1 "http://127.0.0.1:${solver_port}/" >/dev/null 2>&1; then
+      echo "[entrypoint] inline solver HTTP ready (health unavailable)"
       return 0
     fi
     if ! kill -0 "${solver_pid}" 2>/dev/null; then
       echo "[entrypoint] WARN: inline solver exited early; tail solver log:" >&2
-      tail -n 40 /app/turnstile-solver/logs/turnstile_solver.log 2>/dev/null || true
+      tail -n 40 "${solver_log}" 2>/dev/null || true
       return 0
     fi
     sleep 1
