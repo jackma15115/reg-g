@@ -1037,7 +1037,7 @@ def relogin_with_password(
 
 
 # --------------------------------------------------------------------------- #
-# mail provider: moemail / yyds / gptmail / cfmail / duckmail
+# mail provider: moemail / yyds / gptmail / cfmail / duckmail / ti-temp-mail
 # --------------------------------------------------------------------------- #
 def _make_email_receiver(
     *,
@@ -1077,18 +1077,40 @@ def _make_email_receiver(
     # a custom prefix field; ignore leftover config values for new mailboxes.
     pre = secrets.token_hex(5).lower()
 
-    mailbox = create_mailbox(
-        provider=prov,
-        name=pre,
-        domain=dom or None,
-        expiry_ms=expiry_ms if expiry_ms is not None else MOEMAIL_EXPIRY_MS,
-        api_key=key or None,
-        base_url=base or None,
-        mailbox_mode=mailbox_mode,
-    )
+    if prov == "ti-temp-mail":
+        print(
+            f"[ti-temp-mail] create mailbox: base={base or 'https://keldie.cyou'} "
+            f"mode={mailbox_mode or 'maindomain'} domain={dom or '<auto>'} "
+            f"create_auth={'set' if key else 'unset'}",
+            flush=True,
+        )
+    try:
+        mailbox = create_mailbox(
+            provider=prov,
+            name=pre,
+            domain=dom or None,
+            expiry_ms=expiry_ms if expiry_ms is not None else MOEMAIL_EXPIRY_MS,
+            api_key=key or None,
+            base_url=base or None,
+            mailbox_mode=mailbox_mode,
+        )
+    except Exception as exc:
+        if prov == "ti-temp-mail":
+            print(
+                f"[ti-temp-mail] create mailbox failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        raise
     email_id = mailbox["id"]
     address = mailbox["email"]
     token = str(mailbox.get("token") or "")
+    if prov == "ti-temp-mail":
+        print(
+            f"[ti-temp-mail] mailbox created: address={address} "
+            f"mode={mailbox.get('mailbox_mode') or mailbox_mode or 'maindomain'} "
+            f"mailbox_token={'set' if token else 'missing'}",
+            flush=True,
+        )
 
     class _MailReceiver:
         def __init__(
@@ -1100,6 +1122,7 @@ def _make_email_receiver(
             *,
             provider: str,
             token: str = "",
+            mailbox_mode: str = "",
         ):
             self.email = email
             self.email_id = email_id
@@ -1119,6 +1142,7 @@ def _make_email_receiver(
             self.base_url = base_url or default_base
             self.provider = provider
             self.token = token
+            self.mailbox_mode = mailbox_mode or "maindomain"
 
         def wait_for_code(
             self,
@@ -1126,6 +1150,7 @@ def _make_email_receiver(
             *,
             should_cancel=None,
             poll_interval: float | None = None,
+            on_progress=None,
         ) -> str:
             import re as _re
 
@@ -1133,9 +1158,37 @@ def _make_email_receiver(
             # Keep polls short so cooperative cancel can land quickly.
             poll = float(poll_interval if poll_interval is not None else 1.0)
             poll = max(0.4, min(poll, 2.0))
+            started_at = time.time()
+            attempt = 0
+            last_message_count = -1
+            last_error = ""
+            last_detail_error = ""
+            next_log_at = started_at
+
+            def _emit(message: str) -> None:
+                if self.provider != "ti-temp-mail":
+                    return
+                print(f"[ti-temp-mail] {message}", flush=True)
+                if callable(on_progress):
+                    on_progress(message)
+
+            _emit(
+                f"开始收信：address={self.email} base={self.base_url} "
+                f"mode={self.mailbox_mode} 超时={float(timeout or 120):.0f}秒 "
+                f"mailbox_token={'set' if self.token else 'missing'}"
+            )
             while time.time() < deadline:
                 if callable(should_cancel) and should_cancel():
                     raise _RegCancelled("cancelled while waiting for email code")
+                attempt += 1
+                request_started = time.time()
+                request_log_due = self.provider == "ti-temp-mail" and (
+                    attempt == 1 or request_started >= next_log_at
+                )
+                if request_log_due:
+                    _emit(
+                        f"轮询 #{attempt} 请求中：GET {self.base_url.rstrip('/')}/messages"
+                    )
                 try:
                     messages = fetch_messages(
                         self.email_id,
@@ -1146,6 +1199,44 @@ def _make_email_receiver(
                         address=self.email,
                         token=self.token or None,
                     )
+                    now = time.time()
+                    message_count = len(messages)
+                    detail_errors = [
+                        str(item.get("_detail_error") or "")
+                        for item in messages
+                        if isinstance(item, dict) and item.get("_detail_error")
+                    ]
+                    detail_error = detail_errors[0][:160] if detail_errors else ""
+                    recovered = bool(last_error)
+                    detail_recovered = bool(last_detail_error and not detail_error)
+                    log_snapshot = (
+                        self.provider == "ti-temp-mail"
+                        and (
+                            attempt == 1
+                            or request_log_due
+                            or message_count != last_message_count
+                            or now >= next_log_at
+                            or recovered
+                            or detail_recovered
+                            or detail_error != last_detail_error
+                        )
+                    )
+                    if log_snapshot:
+                        status = (
+                            f"轮询 #{attempt}：耗时={now - started_at:.0f}秒 "
+                            f"请求耗时={now - request_started:.1f}秒 邮件={message_count}"
+                        )
+                        if recovered:
+                            status += "，接口已恢复"
+                        if detail_recovered:
+                            status += "，详情接口已恢复"
+                        if detail_error:
+                            status += f"，详情失败={detail_error}"
+                        _emit(status)
+                        next_log_at = now + 5.0
+                    last_message_count = message_count
+                    last_error = ""
+                    last_detail_error = detail_error
                     for item in messages:
                         # Prefer xAI AAA-BBB codes first.
                         text = "\n".join(
@@ -1167,21 +1258,54 @@ def _make_email_receiver(
                             r"\b([A-Z0-9]{3})-([A-Z0-9]{3})\b", text, flags=_re.I
                         )
                         if match:
+                            _emit(
+                                f"找到验证码：轮询={attempt} 耗时={time.time() - started_at:.0f}秒 "
+                                f"message_id={item.get('id') or item.get('_id') or '?'}"
+                            )
                             return "".join(match.groups()).upper()
                         # Also accept plain 6-char alnum codes from xAI mails.
                         match2 = _re.search(
                             r"\b([A-Z0-9]{6})\b", text, flags=_re.I
                         )
                         if match2 and "x.ai" in text.lower():
+                            _emit(
+                                f"找到验证码：轮询={attempt} 耗时={time.time() - started_at:.0f}秒 "
+                                f"message_id={item.get('id') or item.get('_id') or '?'}"
+                            )
                             return match2.group(1).upper()
                         extracted = item.get("extracted") or {}
                         codes = extracted.get("codes") or []
                         for code in codes:
                             clean = str(code).replace("-", "").strip().upper()
                             if len(clean) == 6 and _re.fullmatch(r"[A-Z0-9]{6}", clean):
+                                _emit(
+                                    f"找到验证码：轮询={attempt} 耗时={time.time() - started_at:.0f}秒 "
+                                    f"message_id={item.get('id') or item.get('_id') or '?'}"
+                                )
                                 return clean
-                except Exception:
-                    pass
+                    if self.provider == "ti-temp-mail" and messages and log_snapshot:
+                        subjects = ", ".join(
+                            str(item.get("subject") or "<no subject>")
+                            .replace("\r", " ")
+                            .replace("\n", " ")[:80]
+                            for item in messages[:3]
+                            if isinstance(item, dict)
+                        )
+                        _emit(f"收到邮件但未识别验证码：subjects={subjects or '<empty>'}")
+                except _RegCancelled:
+                    raise
+                except Exception as exc:
+                    now = time.time()
+                    error = f"{type(exc).__name__}: {exc}"[:240]
+                    if self.provider == "ti-temp-mail" and (
+                        error != last_error or now >= next_log_at
+                    ):
+                        _emit(
+                            f"轮询 #{attempt} 异常：耗时={now - started_at:.0f}秒 "
+                            f"请求耗时={now - request_started:.1f}秒 {error}"
+                        )
+                        next_log_at = now + 5.0
+                    last_error = error
                 # Sleep in small slices so stop can interrupt mid-wait.
                 slept = 0.0
                 while slept < poll:
@@ -1191,6 +1315,14 @@ def _make_email_receiver(
                     time.sleep(step)
                     slept += step
                 poll = min(2.0, poll + 0.15)
+            if self.provider == "ti-temp-mail":
+                timeout_message = (
+                    f"TI Temp Mail 收信超时：耗时={time.time() - started_at:.0f}秒 "
+                    f"轮询={attempt} 最后邮件数={max(0, last_message_count)} "
+                    f"最后错误={last_error or '<none>'}"
+                )
+                _emit(timeout_message)
+                raise RuntimeError(timeout_message)
             raise RuntimeError("timeout waiting for xAI email verification code")
 
     return address, _MailReceiver(
@@ -1200,6 +1332,7 @@ def _make_email_receiver(
         base_url=base,
         provider=prov,
         token=token,
+        mailbox_mode=str(mailbox.get("mailbox_mode") or mailbox_mode or "maindomain"),
     )
 
 
@@ -1330,6 +1463,20 @@ def _prepare_registration_session(
     password = f"Aa{os.urandom(5).hex()}9!xZ"
     sid = f"gba_{uuid.uuid4().hex[:16]}"
 
+    receiver_provider = str(getattr(receiver, "provider", "") or "")
+    receiver_mode = str(getattr(receiver, "mailbox_mode", "") or "")
+    mail_logs: list[dict[str, Any]] = []
+    if receiver_provider == "ti-temp-mail":
+        mail_logs.append(
+            {
+                "at": _now(),
+                "message": (
+                    f"邮箱已创建：address={email} mode={receiver_mode or 'maindomain'} "
+                    f"base={getattr(receiver, 'base_url', '') or 'https://keldie.cyou'}"
+                ),
+            }
+        )
+
     sess = {
         "id": sid,
         "status": "queued",
@@ -1342,6 +1489,9 @@ def _prepare_registration_session(
         "oauth": None,
         "auth_json": None,
         "error": None,
+        "mail_provider": receiver_provider,
+        "mailbox_mode": receiver_mode,
+        "mail_logs": mail_logs,
         "yescaptcha_key": yescaptcha_key,
         "proxy": proxy or None,
         "adapter_build": ADAPTER_BUILD,
@@ -2650,11 +2800,19 @@ def _run_registration(
             _check_cancel()
             return False
 
+        def _mail_progress(message: str) -> None:
+            with _lock:
+                current = _sessions.get(sid) or sess
+                logs = list(current.get("mail_logs") or [])
+            logs.append({"at": _now(), "message": str(message or "")[:500]})
+            update("waiting_email", str(message or ""), mail_logs=logs[-20:])
+
         try:
             code = receiver.wait_for_code(
                 timeout=120.0,
                 should_cancel=_mail_should_cancel,
                 poll_interval=1.0,
+                on_progress=_mail_progress,
             )
         except TypeError:
             # Older receiver signature fallback.
@@ -2708,7 +2866,12 @@ def _run_registration(
                 try:
                     client.create_email_validation_code(email)
                     update("waiting_email", "waiting for fresh xAI verification code")
-                    code = receiver.wait_for_code(timeout=120)
+                    code = receiver.wait_for_code(
+                        timeout=120,
+                        should_cancel=_mail_should_cancel,
+                        poll_interval=1.0,
+                        on_progress=_mail_progress,
+                    )
                     code = (
                         str(code or "")
                         .strip()

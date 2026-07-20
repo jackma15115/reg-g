@@ -2308,6 +2308,17 @@
         return wrapLines(lines);
       }
 
+      function appendMailLogs(lines, logs, label) {
+        var entries = Array.isArray(logs) ? logs.slice(-6) : [];
+        entries.forEach(function (entry) {
+          var message = typeof entry === "string" ? entry : String((entry || {}).message || "");
+          if (!message) return;
+          var at = Number((entry || {}).at || 0);
+          var stamp = at ? new Date(at * 1000).toLocaleTimeString([], {hour12: false}) : "";
+          lines.push(line((label || "邮箱") + (stamp ? " [" + stamp + "]" : "") + "：" + toChineseText(message), "muted"));
+        });
+      }
+
       function renderTaskLog(data) {
         var state = normalizeStatus(data.status || data.batch_status || "running");
         var counts = extractRegCounts(data);
@@ -2319,6 +2330,7 @@
         var message = toChineseText(data.message || "");
         if (!message && typeof data.error === "string") message = toChineseText(data.error);
         if (message) lines.push(line("说明：" + message, state.kind === "bad" ? "bad" : ""));
+        appendMailLogs(lines, data.mail_logs, "邮箱日志");
         if (data.total || data.done || data.running || counts.ok || counts.fail) {
           lines.push(line(
             "进度：总数 " + (data.total || data.count || 0)
@@ -2338,6 +2350,7 @@
         var sessions = (data.sessions || []).slice(0, 8);
         sessions.forEach(function (s) {
           lines.push(line("子任务：" + (s.email || s.id || "-") + " - " + normalizeStatus(s.status).label + " - " + toChineseText(s.message || s.error || "")));
+          appendMailLogs(lines, s.mail_logs, "收件");
         });
         if (state.terminal && state.kind === "ok") lines.push(line("账号已保存，正在刷新账号列表。", "ok"));
         return wrapLines(lines);
@@ -3265,6 +3278,7 @@
           registering: "注册中",
           waiting_solver: "等待过盾",
           solving_turnstile: "正在过盾",
+          waiting_email: "等待邮件",
           probing: "测活中",
           active: "可用",
           registered: "已注册",
@@ -3307,12 +3321,14 @@
           error: typeof data.error === "string" ? data.error : "",
           cancelled: data.cancelled,
           running: data.running,
+          mail_logs: data.mail_logs || [],
           sessions: (data.sessions || []).slice(0, 20).map(function (s) {
             return {
               id: s.id,
               email: s.email,
               status: s.status,
-              message: s.message || s.error || ""
+              message: s.message || s.error || "",
+              mail_logs: s.mail_logs || []
             };
           })
         };

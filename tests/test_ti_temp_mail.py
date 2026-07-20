@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -113,6 +115,35 @@ class TiTempMailTests(unittest.TestCase):
         )
         self.assertEqual(client.get.call_args_list[1].kwargs["headers"], expected_headers)
 
+    def test_fetch_reports_detail_endpoint_failure(self) -> None:
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.get.side_effect = [
+            _response(
+                200,
+                {
+                    "messages": [
+                        {
+                            "_id": "message-1",
+                            "subject": "Verify your email",
+                            "bodyPreview": "",
+                        }
+                    ]
+                },
+            ),
+            _response(502, {"error": "upstream unavailable"}),
+        ]
+
+        with patch("moemail.httpx.Client", return_value=client):
+            messages = moemail.ti_temp_mail_fetch_messages(
+                "random@example.com",
+                token="mailbox-token",
+            )
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("HTTP 502", messages[0]["_detail_error"])
+
     def test_registration_config_keeps_provider_specific_slots(self) -> None:
         cfg = register_lite_store.normalize_registration_config(
             {
@@ -154,6 +185,54 @@ class TiTempMailTests(unittest.TestCase):
         self.assertIsNone(create.call_args.kwargs["api_key"])
         self.assertIsNone(create.call_args.kwargs["base_url"])
         self.assertEqual(create.call_args.kwargs["mailbox_mode"], "subdomain")
+
+    def test_adapter_emits_ti_mail_poll_progress_without_tokens(self) -> None:
+        import grok_build_adapter
+
+        mailbox = {
+            "id": "random@sub.ticloud.tech",
+            "email": "random@sub.ticloud.tech",
+            "token": "mailbox-token-secret",
+            "mailbox_mode": "subdomain",
+        }
+        progress: list[str] = []
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch("moemail.create_mailbox", return_value=mailbox),
+            patch(
+                "moemail.fetch_messages",
+                side_effect=[
+                    RuntimeError("HTTP 502: temporary upstream error"),
+                    [],
+                    [
+                        {
+                            "id": "message-1",
+                            "subject": "Your x.ai code ABC-123",
+                            "content": "Your x.ai code ABC-123",
+                        }
+                    ],
+                ],
+            ),
+            patch("grok_build_adapter.time.sleep", return_value=None),
+        ):
+            _, receiver = grok_build_adapter._make_email_receiver(
+                mail_provider="ti-temp-mail",
+                mailbox_mode="subdomain",
+            )
+            code = receiver.wait_for_code(
+                timeout=5,
+                poll_interval=0.4,
+                on_progress=progress.append,
+            )
+
+        output = stdout.getvalue()
+        self.assertEqual(code, "ABC123")
+        self.assertTrue(any("轮询 #1 异常" in item for item in progress))
+        self.assertTrue(any("接口已恢复" in item for item in progress))
+        self.assertTrue(any("找到验证码" in item for item in progress))
+        self.assertIn("[ti-temp-mail]", output)
+        self.assertNotIn("mailbox-token-secret", output)
 
 
 if __name__ == "__main__":

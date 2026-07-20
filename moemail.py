@@ -1761,9 +1761,15 @@ def ti_temp_mail_fetch_messages(
                 f"TI Temp Mail list messages failed {resp.status_code}: {resp.text[:500]}"
             )
         data = resp.json() if resp.content else {}
-        messages = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"Unexpected TI Temp Mail messages response: {type(data).__name__}"
+            )
+        messages = data.get("messages")
         if not isinstance(messages, list):
-            return []
+            raise RuntimeError(
+                "Unexpected TI Temp Mail messages response: missing messages list"
+            )
 
         out: list[dict[str, Any]] = []
         for item in messages[:20]:
@@ -1801,8 +1807,17 @@ def ti_temp_mail_fetch_messages(
                             row["attachments_count"] = int(
                                 body.get("attachmentsCount") or row["attachments_count"]
                             )
-                except Exception:
-                    pass
+                        else:
+                            row["_detail_error"] = (
+                                "Unexpected detail response: "
+                                f"{type(body).__name__}"
+                            )
+                    else:
+                        row["_detail_error"] = (
+                            f"HTTP {detail.status_code}: {detail.text[:200]}"
+                        )
+                except Exception as exc:
+                    row["_detail_error"] = f"{type(exc).__name__}: {exc}"[:240]
             text_blob = "\n".join(
                 str(row.get(k) or "")
                 for k in ("subject", "text", "html", "content", "from")
