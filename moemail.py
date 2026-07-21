@@ -1705,6 +1705,8 @@ def ti_temp_mail_create_mailbox(
         for part in re.split(r"[,;\s]+", domain or "")
         if part.strip().lstrip("@").strip(".")
     ]
+    # Pick exactly once, immediately before building the outbound payload.
+    # The configured value may contain comma/semicolon/newline-separated domains.
     dom = random.choice(domain_pool) if domain_pool else ""
     if dom:
         payload["domain"] = dom
@@ -1733,6 +1735,7 @@ def ti_temp_mail_create_mailbox(
         "token": token,
         "provider": "ti-temp-mail",
         "mailbox_mode": mode,
+        "selected_domain": dom,
         "raw": data,
     }
 

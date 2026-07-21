@@ -29,7 +29,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-16-solver-hot-reload-1"
+ADAPTER_BUILD = "2026-07-21-success-target-ti-domain-pool-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -1069,7 +1069,11 @@ def _make_email_receiver(
         )
     # Non-MoeMail providers: empty domain means provider-side auto/random pick.
     # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-    if prov in {"yyds", "gptmail", "cfmail", "duckmail", "ti-temp-mail"}:
+    if prov == "ti-temp-mail":
+        # Preserve the full pool. TI Temp Mail selects once while constructing
+        # the actual POST /mailbox payload, so logs and the request agree.
+        dom = str(domain or "").strip()
+    elif prov in {"yyds", "gptmail", "cfmail", "duckmail"}:
         dom = _pick_domain_from_pool(domain)
     else:
         dom = _pick_domain_from_pool(domain) or (MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -1078,9 +1082,10 @@ def _make_email_receiver(
     pre = secrets.token_hex(5).lower()
 
     if prov == "ti-temp-mail":
+        domain_count = len(_domain_pool(dom))
         print(
             f"[ti-temp-mail] create mailbox: base={base or 'https://keldie.cyou'} "
-            f"mode={mailbox_mode or 'maindomain'} domain={dom or '<auto>'} "
+            f"mode={mailbox_mode or 'maindomain'} domain_pool={domain_count or '<auto>'} "
             f"create_auth={'set' if key else 'unset'}",
             flush=True,
         )
@@ -1107,6 +1112,7 @@ def _make_email_receiver(
     if prov == "ti-temp-mail":
         print(
             f"[ti-temp-mail] mailbox created: address={address} "
+            f"selected_domain={mailbox.get('selected_domain') or address.rpartition('@')[2]} "
             f"mode={mailbox.get('mailbox_mode') or mailbox_mode or 'maindomain'} "
             f"mailbox_token={'set' if token else 'missing'}",
             flush=True,
@@ -1610,9 +1616,10 @@ def start_registration(
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
-    ``count`` > 1 enables batch mode. ``concurrency`` is the real in-flight
-    limit: e.g. concurrency=3 means only 3 accounts register at the same time;
-    when one finishes, the next queued account starts.
+    ``count`` is the number of successful accounts to produce. Failed attempts
+    are recorded but do not consume that target. ``concurrency`` is the real
+    in-flight limit; failed slots are replenished until the target is reached
+    or the operator stops the batch.
 
     ``proxy`` may be a single URL or a multi-line proxy pool. Each registration
     job picks one entry via ``proxy_strategy`` (round_robin / random / sticky).
@@ -1749,20 +1756,6 @@ def start_registration(
     except Exception:
         mail_prov = (mail_provider or "moemail").strip().lower() or "moemail"
 
-    # Single job — keep original response shape for UI compatibility.
-    if n == 1:
-        return _start_one_registration(
-            yescaptcha_key=key,
-            proxy=proxy_val,
-            moemail_api_key=moemail_api_key,
-            moemail_base_url=moemail_base_url,
-            prefix=prefix,
-            domain=domain,
-            expiry_ms=expiry_ms,
-            mail_provider=mail_prov,
-            mailbox_mode=mailbox_mode,
-        )
-
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     # Snapshot keeps the full multi-line text so resume / UI can re-parse the pool.
     proxy_snapshot = (proxy or "\n".join(proxy_pool) or proxy_val or "").strip()
@@ -1788,11 +1781,12 @@ def start_registration(
         "created_at": _now(),
         "updated_at": _now(),
         "count": n,
+        "target_success": n,
         "concurrency": workers,
         "stagger_ms": stagger,
         "session_ids": [],
         "adapter_build": ADAPTER_BUILD,
-        "message": f"batch started count={n} concurrency={workers}",
+        "message": f"batch started target_success={n} concurrency={workers}",
         "error": None,
         "finished": 0,
         "ok_count": 0,
@@ -1810,7 +1804,7 @@ def start_registration(
     # session finishes (previously only the terminal row was written).
     _record_register_task(
         task_id=batch_id,
-        summary=f"协议注册批次启动 count={n} concurrency={workers}",
+        summary=f"协议注册批次启动 target_success={n} concurrency={workers}",
         status="running",
         ok=None,
         progress_done=0,
@@ -1819,6 +1813,7 @@ def start_registration(
         detail={
             "batch_id": batch_id,
             "count": n,
+            "target_success": n,
             "concurrency": workers,
             "stagger_ms": stagger,
             "phase": "started",
@@ -1858,6 +1853,7 @@ def start_registration(
         "batch": True,
         "batch_id": batch_id,
         "count": n,
+        "target_success": n,
         "concurrency": workers,
         "stagger_ms": stagger,
         "proxy_pool_count": len(proxy_pool),
@@ -1865,7 +1861,7 @@ def start_registration(
         "sessions": sessions,
         "adapter_build": ADAPTER_BUILD,
         "message": (
-            f"batch started: count={n}, threads={workers} "
+            f"batch started: target_success={n}, threads={workers} "
             f"(in-flight cap), proxy_pool={len(proxy_pool)}, queued/started={len(sids)}"
         ),
         # Back-compat: first session fields for old UI single-session path.
@@ -2018,9 +2014,12 @@ def _spawn_batch_runner(
         prior_finished = int(b.get("finished") or 0)
         prior_ok = int(b.get("ok_count") or 0)
         prior_fail = int(b.get("fail_count") or 0)
+        target_success = int(b.get("count") or (prior_ok + max(0, int(remaining))))
+        b["target_success"] = target_success
+        b["remaining_success"] = max(0, target_success - prior_ok)
         b["message"] = (
-            f"starting remaining={remaining} threads={workers}"
-            + (f" already_done={prior_finished}" if prior_finished else "")
+            f"starting remaining_success={max(0, target_success - prior_ok)} threads={workers}"
+            + (f" prior_attempts={prior_finished}" if prior_finished else "")
             + (f" proxies={len(proxy_pool)}" if proxy_pool else "")
         )
         if prior_finished <= 0 and not (b.get("session_ids") or []):
@@ -2043,11 +2042,12 @@ def _spawn_batch_runner(
         finished = int(_seed.get("finished") or 0)
         ok_n = int(_seed.get("ok_count") or 0)
         fail_n = int(_seed.get("fail_count") or 0)
+        target_total = int(_seed.get("count") or (ok_n + max(0, int(remaining))))
         stop_renew = False
         # Feed the pool gradually: only keep ~workers(+prefetch) jobs prepared
         # at once. Submitting all remaining jobs up-front used to create hundreds
         # of mailboxes immediately and made stop/cancel racey under multi-thread.
-        next_i = 1
+        next_i = len(_seed.get("session_ids") or []) + 1
         in_flight: dict[Any, int] = {}
         prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
         max_inflight = max(1, workers + prefetch)
@@ -2261,6 +2261,9 @@ def _spawn_batch_runner(
                 errors.append(f"#{idx}: empty result")
             elif r.get("ok"):
                 ok_n += 1
+            elif str(r.get("status") or "").lower() in {"cancelled", "stopped"}:
+                # Cancellation ends an attempt but is not a registration failure.
+                pass
             else:
                 fail_n += 1
                 errors.append(
@@ -2280,23 +2283,26 @@ def _spawn_batch_runner(
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = True
                     b["inflight"] = len(in_flight)
+                    b["target_success"] = target_total
+                    b["remaining_success"] = max(0, target_total - ok_n)
                     b["message"] = (
-                        f"running {finished}/{target_total} done "
-                        f"(ok={ok_n} fail={fail_n}, threads={workers}, "
-                        f"inflight={len(in_flight)})"
+                        f"target {ok_n}/{target_total} successes; "
+                        f"attempts={finished} fail={fail_n}, threads={workers}, "
+                        f"inflight={len(in_flight)}"
                     )
                     _mirror_reg_batch(bid, dict(b))
 
         try:
-            target_total = int((_load_reg_batch(bid) or {}).get("count") or remaining)
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix=f"gba-batch-{bid[-6:]}"
             ) as pool:
                 while True:
-                    # Fill up to concurrency(+prefetch) only while not cancelled.
+                    # Every in-flight attempt is a potential success. Never keep
+                    # more candidates than the remaining success quota, which
+                    # prevents concurrent completions from overshooting count.
                     while (
-                        next_i <= remaining
-                        and len(in_flight) < max_inflight
+                        len(in_flight) < max_inflight
+                        and ok_n + len(in_flight) < target_total
                         and not _batch_cancel_requested()
                     ):
                         fut = pool.submit(_job, next_i)
@@ -2309,10 +2315,12 @@ def _spawn_batch_runner(
                                 bb["updated_at"] = _now()
                                 if not bb.get("cancel_requested"):
                                     bb["status"] = "running"
+                                bb["target_success"] = target_total
+                                bb["remaining_success"] = max(0, target_total - ok_n)
                                 bb["message"] = (
-                                    f"running {finished}/{target_total} done "
-                                    f"(ok={ok_n} fail={fail_n}, threads={workers}, "
-                                    f"inflight={len(in_flight)})"
+                                    f"target {ok_n}/{target_total} successes; "
+                                    f"attempts={finished} fail={fail_n}, threads={workers}, "
+                                    f"inflight={len(in_flight)}"
                                 )
                                 _mirror_reg_batch(bid, dict(bb))
 
@@ -2364,37 +2372,33 @@ def _spawn_batch_runner(
                     b["runner_alive"] = False
                     b["inflight"] = 0
                     target_total = int(b.get("count") or finished or 0)
+                    b["target_success"] = target_total
+                    b["remaining_success"] = max(0, target_total - ok_n)
                     cancelled = bool(b.get("cancel_requested")) or str(b.get("status") or "").lower() in (
                         "stopping",
                         "cancelled",
                         "stopped",
                     )
-                    if cancelled and finished < target_total:
+                    if ok_n >= target_total:
+                        b["status"] = "done"
+                        b["error"] = None
+                        b["message"] = (
+                            f"target reached {ok_n}/{target_total} successes; "
+                            f"attempts={finished} fail={fail_n}, threads={workers}"
+                        )
+                    elif cancelled:
                         b["status"] = "cancelled"
                         b["message"] = (
-                            f"stopped {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
-                        )
-                    elif fail_n and not ok_n:
-                        b["status"] = "error"
-                        b["error"] = "; ".join(errors[:5]) or "all failed"
-                        b["message"] = (
-                            f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
-                            + (f"; errors={len(errors)}" if errors else "")
-                        )
-                    elif fail_n:
-                        b["status"] = "partial"
-                        b["message"] = (
-                            f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
-                            + (f"; errors={len(errors)}" if errors else "")
+                            f"stopped at {ok_n}/{target_total} successes; "
+                            f"attempts={finished} fail={fail_n}, threads={workers}"
                         )
                     else:
-                        b["status"] = "done"
+                        b["status"] = "error"
+                        b["error"] = "; ".join(errors[:5]) or "batch runner stopped before target"
                         b["message"] = (
-                            f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"runner stopped at {ok_n}/{target_total} successes; "
+                            f"attempts={finished} fail={fail_n}, threads={workers}"
+                            + (f"; errors={len(errors)}" if errors else "")
                         )
                     _mirror_reg_batch(bid, dict(b))
                     st = str(b.get("status") or "done")
@@ -2421,14 +2425,16 @@ def _spawn_batch_runner(
                         task_id=str(bid),
                         summary=str(b.get("message") or f"协议注册批次 {bid}"),
                         status=st,
-                        ok=st in {"done", "partial"} and ok_n > 0,
-                        progress_done=int(finished or 0),
-                        progress_total=int(target_total or finished or 0),
+                        ok=st == "done" and ok_n >= target_total,
+                        progress_done=min(int(ok_n or 0), int(target_total or ok_n or 0)),
+                        progress_total=int(target_total or ok_n or 0),
                         finished=True,
                         detail={
                             "batch_id": bid,
                             "ok_count": ok_n,
                             "fail_count": fail_n,
+                            "attempts": finished,
+                            "target_success": target_total,
                             "threads": workers,
                             "status": st,
                             "errors": (errors or [])[:10],
@@ -3606,7 +3612,7 @@ def resume_registration_batch(
     force: bool = False,
     reclaim_stale_sec: float | None = None,
 ) -> dict[str, Any]:
-    """Reclaim orphan sessions and re-spawn the batch runner for remaining count.
+    """Reclaim orphan sessions and resume until the success target is reached.
 
     Used after process restart when Redis still shows status=running but no
     worker is actually spawning jobs.
@@ -3662,34 +3668,44 @@ def resume_registration_batch(
         stale_sec=reclaim_stale_sec, batch_id=bid
     )
 
+    batch = _load_reg_batch(bid) or batch
     count = int(batch.get("count") or 0)
     finished = int(batch.get("finished") or 0)
-    # Prefer durable session list to compute remaining if counters lag.
+    stored_ok = int(batch.get("ok_count") or 0)
+    # Prefer durable sessions when mirrored counters lag behind a completed job.
     sids = list(batch.get("session_ids") or [])
     terminal = 0
-    if sids and _reg_redis():
-        try:
-            from store import sessions_redis
+    observed_ok = 0
+    for sid in sids:
+        sess = _load_reg_sess(str(sid)) or {}
+        if not sess and _reg_redis():
+            try:
+                from store import sessions_redis
 
-            for sid in sids:
                 sess = sessions_redis.reg_sess_get(str(sid)) or {}
-                st_s = str(sess.get("status") or "").lower()
-                if st_s in _TERMINAL_STATUSES:
-                    terminal += 1
-        except Exception:
-            terminal = finished
-    else:
-        terminal = finished
-    remaining = max(0, count - max(finished, terminal))
+            except Exception:
+                sess = {}
+        st_s = str(sess.get("status") or "").lower()
+        if st_s in _TERMINAL_STATUSES:
+            terminal += 1
+        if st_s in {"imported", "success", "completed"}:
+            observed_ok += 1
+    effective_ok = max(stored_ok, observed_ok)
+    finished = max(finished, terminal)
+    remaining = max(0, count - effective_ok)
     if remaining <= 0:
         with _lock:
             b = _batches.get(bid) or dict(batch)
-            b["status"] = "done" if int(b.get("fail_count") or 0) == 0 else "partial"
+            b["status"] = "done"
             b["runner_alive"] = False
+            b["ok_count"] = effective_ok
+            b["finished"] = finished
+            b["target_success"] = count
+            b["remaining_success"] = 0
             b["updated_at"] = _now()
             b["message"] = (
-                f"resume: nothing remaining "
-                f"(count={count} finished={finished} terminal={terminal})"
+                f"resume: target already reached "
+                f"(success={effective_ok}/{count} attempts={finished})"
             )
             _batches[bid] = b
             _mirror_reg_batch(bid, dict(b))
@@ -3730,11 +3746,15 @@ def resume_registration_batch(
     with _lock:
         b = _batches.get(bid) or dict(batch)
         b["cancel_requested"] = False
+        b["ok_count"] = effective_ok
+        b["finished"] = finished
+        b["target_success"] = count
+        b["remaining_success"] = remaining
         if str(b.get("status") or "").lower() in {"stopping", "cancelled", "stopped", "error"}:
             b["status"] = "running"
         b["updated_at"] = _now()
         b["message"] = (
-            f"resume requested remaining={remaining} "
+            f"resume requested remaining_success={remaining} "
             f"(reclaimed={reclaimed.get('reclaimed') or 0})"
         )
         _batches[bid] = b
@@ -3824,7 +3844,7 @@ def reclaim_orphaned_registration_batches(
             continue
         st = str(b.get("status") or "").strip().lower()
         if st not in {"running", "starting", "stopping", "partial"} and not (
-            st == "error" and int(b.get("finished") or 0) < int(b.get("count") or 0)
+            st == "error" and int(b.get("ok_count") or 0) < int(b.get("count") or 0)
         ):
             continue
         if b.get("cancel_requested") and st in {"stopping", "cancelled", "stopped"}:
@@ -3860,9 +3880,9 @@ def reclaim_orphaned_registration_batches(
             except Exception:
                 pass
         count = int(b.get("count") or 0)
-        finished = int(b.get("finished") or 0)
-        if count > 0 and finished >= count:
-            skipped.append({"batch_id": bid, "reason": "already_finished", "status": st})
+        ok_count = int(b.get("ok_count") or 0)
+        if count > 0 and ok_count >= count:
+            skipped.append({"batch_id": bid, "reason": "target_reached", "status": st})
             continue
         if not auto_resume:
             skipped.append({"batch_id": bid, "reason": "auto_resume_disabled", "status": st})
@@ -4127,13 +4147,7 @@ def _batch_stats(
     *,
     batch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute batch counters from live sessions.
-
-    Missing sessions (TTL expired / not mirrored) are *not* treated as running —
-    that previously made finished historical batches look active after Redis
-    session keys aged out. When no live sessions remain, fall back to the
-    persisted batch status/message counters.
-    """
+    """Compute success-target progress while retaining attempt counters."""
     imported = error = running = cancelled = missing = 0
     for sid in session_ids:
         sess = _load_reg_sess(sid)
@@ -4150,137 +4164,58 @@ def _batch_stats(
         else:
             running += 1
 
-    total = len(session_ids)
-    observed = imported + error + cancelled + running
-    done = imported + error + cancelled
-    target = 0
-    if isinstance(batch, dict):
+    cfg = batch if isinstance(batch, dict) else {}
+
+    def _int_field(name: str, default: int = 0) -> int:
         try:
-            target = int(batch.get("count") or 0)
-        except Exception:
-            target = 0
+            return int(cfg.get(name) or default)
+        except (TypeError, ValueError):
+            return default
+
+    target = _int_field("count", len(session_ids))
     if target <= 0:
-        target = total
+        target = max(1, len(session_ids))
+    imported = max(imported, _int_field("ok_count"), _int_field("imported"))
+    error = max(error, _int_field("fail_count"))
+    cancelled = max(cancelled, _int_field("cancelled"))
+    terminal_attempts = imported + error + cancelled
+    finished = max(terminal_attempts, _int_field("finished"), _int_field("done"))
+    attempts = max(len(session_ids), _int_field("spawned"), finished)
+    stored = str(cfg.get("batch_status") or cfg.get("status") or "").lower()
+    runner_alive = bool(cfg.get("runner_alive"))
+    stop_requested = bool(cfg.get("cancel_requested")) or stored in {
+        "stopping", "cancelled", "stopped"
+    }
 
-    status = "running"
-    if observed == 0:
-        # No live sessions left — trust last mirrored batch status if terminal.
-        stored = ""
-        if isinstance(batch, dict):
-            stored = str(batch.get("batch_status") or batch.get("status") or "").lower()
-        if stored in ("done", "partial", "error", "cancelled", "stopped"):
-            status = stored
-            # Prefer stored counters when present so UI keeps final totals.
-            try:
-                imported = int(batch.get("imported") or imported)
-            except Exception:
-                pass
-            try:
-                error = int(batch.get("error") or error)
-            except Exception:
-                pass
-            try:
-                cancelled = int(batch.get("cancelled") or cancelled)
-            except Exception:
-                pass
-            try:
-                done = int(batch.get("done") or (imported + error + cancelled))
-            except Exception:
-                done = imported + error + cancelled
-            running = 0
-        elif total and missing >= total:
-            # All session keys gone and no terminal marker.
-            # Prefer counters / message fragments; never keep a fully-missing
-            # batch as "running" forever (ghost cards after Redis TTL).
-            msg = str((batch or {}).get("message") or "")
-            if isinstance(batch, dict):
-                try:
-                    imported = int(batch.get("imported") or imported or 0)
-                except Exception:
-                    pass
-                try:
-                    error = int(batch.get("error") or error or 0)
-                except Exception:
-                    pass
-                try:
-                    cancelled = int(batch.get("cancelled") or cancelled or 0)
-                except Exception:
-                    pass
-            # Parse "ok=N fail=M" style messages written by the spawner.
-            if imported == 0 and error == 0 and cancelled == 0 and msg:
-                import re as _re
-
-                m_ok = _re.search(r"ok\s*=\s*(\d+)", msg)
-                m_fail = _re.search(r"fail\s*=\s*(\d+)", msg)
-                if m_ok:
-                    try:
-                        imported = int(m_ok.group(1))
-                    except Exception:
-                        pass
-                if m_fail:
-                    try:
-                        error = int(m_fail.group(1))
-                    except Exception:
-                        pass
-            done = imported + error + cancelled
-            if cancelled and not imported and not error:
-                status = "cancelled"
-            elif imported and not error and not cancelled:
-                status = "done"
-            elif imported:
-                status = "partial"
-            elif error:
-                status = "error"
-            elif stored in ("stopping",):
-                status = "stopped"
-            else:
-                status = "done"
-            running = 0
-        else:
-            status = "running"
-    elif done >= max(target, total) and running == 0:
-        if cancelled and not imported and not error:
-            status = "cancelled"
-        elif error == 0 and cancelled == 0:
-            status = "done"
-        elif imported:
-            status = "partial"
-        else:
-            status = "error"
-    elif running == 0 and missing > 0 and done > 0 and observed < total:
-        # Partial visibility (some sessions expired) but nothing live.
-        if imported and (error or cancelled or missing):
-            status = "partial"
-        elif imported and not error and not cancelled:
-            status = "done"
-        elif cancelled and not imported and not error:
-            status = "cancelled"
-        elif error and not imported:
-            status = "error"
-        else:
-            status = "partial"
-    elif total and (imported or error or cancelled) and running:
+    if imported >= target and running == 0:
+        status = "done"
+    elif runner_alive and not stop_requested:
+        # A failed wave can briefly leave zero live sessions before refill.
         status = "running"
     elif running:
         status = "running"
-
-    # Honour explicit cooperative stop marker on the batch itself.
-    if isinstance(batch, dict):
-        bst = str(batch.get("status") or "").lower()
-        if bst in ("stopping", "cancelled", "stopped") and running == 0:
-            if status == "running":
-                status = "cancelled" if cancelled or bst != "stopping" else "stopped"
-        if bst == "stopping" and running:
-            status = "running"
+    elif stop_requested:
+        status = "cancelled" if stored != "stopping" or cancelled else "stopped"
+    elif stored in {"done", "partial", "error", "cancelled", "stopped"}:
+        status = stored
+    elif imported:
+        status = "partial"
+    elif error or missing:
+        status = "error"
+    else:
+        status = "running"
 
     return {
-        "total": max(total, target),
+        "total": target,
+        "target_success": target,
         "imported": imported,
         "error": error,
         "cancelled": cancelled,
         "running": running,
         "missing": missing,
-        "done": done,
+        "done": finished,
+        "attempts": attempts,
+        "remaining_success": max(0, target - imported),
         "batch_status": status,
     }
 
@@ -4330,9 +4265,22 @@ def main() -> int:
     if not result.get("ok"):
         return 1
 
-    sid = result["id"]
+    batch_id = str(result.get("batch_id") or "")
+    sid = str(result.get("id") or "")
     deadline = time.time() + 600
     while time.time() < deadline:
+        if batch_id:
+            batch = get_registration_batch(batch_id)
+            if not batch:
+                print("batch disappeared", file=sys.stderr)
+                return 1
+            status = str(batch.get("status") or batch.get("batch_status") or "")
+            print(f"[{time.strftime('%H:%M:%S')}] {status}: {batch.get('message')}")
+            if status in {"done", "error", "cancelled", "stopped"}:
+                print(json.dumps(batch, ensure_ascii=False, indent=2))
+                return 0 if status == "done" else 1
+            time.sleep(5)
+            continue
         sess = get_registration_session(sid, include_auth_json=True)
         if not sess:
             print("session disappeared", file=sys.stderr)

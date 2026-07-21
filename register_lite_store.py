@@ -177,7 +177,7 @@ DEFAULT_SCHEDULE_POLICY: dict[str, Any] = {
     "enabled": False,
     # interval minutes between auto batches (when no batch running)
     "interval_min": 30,
-    # how many accounts each scheduled batch tries to register
+    # successful accounts each scheduled batch must produce; failures are retried
     "batch_count": 10,
     # only run inside local hour window [start, end); end can be < start for overnight
     "window_start_hour": 0,
@@ -611,6 +611,10 @@ def _batch_outcome(batch_id: str) -> dict[str, Any]:
     # Some adapters expose nested stats.
     try:
         success = max(success, int(batch.get("ok_count") or 0))
+    except (TypeError, ValueError):
+        pass
+    try:
+        failed = max(failed, int(batch.get("fail_count") or 0))
     except (TypeError, ValueError):
         pass
     terminal = st in {

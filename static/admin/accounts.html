@@ -1392,7 +1392,7 @@
                   </select>
                 </div>
                 <div>
-                  <label for="count">数量</label>
+                  <label for="count">目标成功数</label>
                   <input id="count" type="number" min="1" value="1" />
                 </div>
                 <div class="span-4">
@@ -1563,6 +1563,7 @@
               <button id="probe-all" class="btn" type="button">探测列表</button>
               <button id="stop-probe" class="btn ghost" type="button">停止探测</button>
               <button id="export-accounts" class="btn" type="button">导出</button>
+              <button id="export-sso-accounts" class="btn" type="button" title="导出纯 SSO，每行一个">导出 SSO</button>
               <button id="export-cpa-accounts" class="btn" type="button">导出 CPA</button>
             </div>
             <div class="pager-actions">
@@ -1875,7 +1876,7 @@
                   <input id="schedule_interval_min" type="number" min="1" max="1440" value="30" />
                 </div>
                 <div>
-                  <label for="schedule_batch_count" title="每次定时启动注册的数量">每批数量</label>
+                  <label for="schedule_batch_count" title="失败会自动补位，直到达到成功目标">每批目标成功数</label>
                   <input id="schedule_batch_count" type="number" min="1" max="1000" value="10" />
                 </div>
                 <div>
@@ -2332,10 +2333,12 @@
         if (message) lines.push(line("说明：" + message, state.kind === "bad" ? "bad" : ""));
         appendMailLogs(lines, data.mail_logs, "邮箱日志");
         if (data.total || data.done || data.running || counts.ok || counts.fail) {
+          var targetSuccess = data.target_success || data.total || data.count || 0;
+          var attempts = data.attempts != null ? data.attempts : (data.done || data.finished || 0);
           lines.push(line(
-            "进度：总数 " + (data.total || data.count || 0)
-              + "，完成 " + (data.done || data.finished || 0)
-              + "，成功 " + (counts.ok || 0)
+            "进度：目标成功 " + targetSuccess
+              + "，已成功 " + (counts.ok || 0)
+              + "，已尝试 " + attempts
               + "，失败 " + (counts.fail || 0)
               + (data.running ? ("，运行中 " + data.running) : "")
           ));
@@ -2829,7 +2832,7 @@
             api_key_note: "服务端设置 CREATE_TOKEN 时填写；Authorization 使用原始 token",
             domain_label: "邮箱域名",
             domain_placeholder: "留空则由服务端随机选择",
-            domain_note: "主域名和子域名模式都支持，可填多个域名供注册任务轮换"
+            domain_note: "可用 ; 或 , 分隔多个域名，每次创建邮箱随机选择一个"
           }
         };
         return map[provider] || map.moemail;
@@ -3315,6 +3318,9 @@
           message: data.message || "",
           total: data.total || data.count,
           done: data.done || data.finished,
+          attempts: data.attempts != null ? data.attempts : data.finished,
+          target_success: data.target_success || data.count,
+          remaining_success: data.remaining_success,
           success: counts.ok,
           failed: counts.fail,
           imported: data.imported || data.ok_count || counts.ok,
@@ -4681,6 +4687,11 @@
         window.location.href = __adminUrl("api", "accounts", "register-email", "export-auth-zip") + "?limit=5000";
       }
 
+      function exportSsoAccounts() {
+        window.location.href = __adminUrl("api", "accounts", "register-email", "export-sso") +
+          "?status=imported,registered,active&format=sso&download=1";
+      }
+
       function exportCpaAccounts() {
         window.location.href = __adminUrl("api", "accounts", "register-email", "export-cpa-zip") + "?limit=5000";
       }
@@ -5152,6 +5163,7 @@
         bind("relogin-selected", "click", reloginSelected);
         bind("delete-selected", "click", deleteSelected);
         bind("export-accounts", "click", exportAccounts);
+        bind("export-sso-accounts", "click", exportSsoAccounts);
         bind("export-cpa-accounts", "click", exportCpaAccounts);
         bind("theme-toggle", "click", toggleTheme);
         applyTheme(currentTheme());

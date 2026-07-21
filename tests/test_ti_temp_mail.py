@@ -61,6 +61,28 @@ class TiTempMailTests(unittest.TestCase):
                     },
                 )
 
+    def test_create_randomly_selects_one_configured_domain(self) -> None:
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.post.return_value = _response(
+            201,
+            {"token": "mailbox-token", "mailbox": "random@b.example"},
+        )
+
+        with (
+            patch("moemail.httpx.Client", return_value=client),
+            patch("moemail.random.choice", return_value="b.example") as choose,
+        ):
+            box = moemail.ti_temp_mail_create_mailbox(
+                domain="a.example;b.example,c.example",
+                base_url="https://keldie.cyou",
+            )
+
+        choose.assert_called_once_with(["a.example", "b.example", "c.example"])
+        self.assertEqual(box["selected_domain"], "b.example")
+        self.assertEqual(client.post.call_args.kwargs["json"]["domain"], "b.example")
+
     def test_fetch_uses_mailbox_token_and_expands_details(self) -> None:
         client = MagicMock()
         client.__enter__.return_value = client
@@ -161,6 +183,18 @@ class TiTempMailTests(unittest.TestCase):
         self.assertEqual(cfg["ti_temp_mail_mode"], "subdomain")
         self.assertEqual(cfg["mailbox_mode"], "subdomain")
 
+    def test_registration_config_preserves_ti_domain_pool(self) -> None:
+        cfg = register_lite_store.normalize_registration_config(
+            {
+                "mail_provider": "ti-temp-mail",
+                "domain": "a.example;b.example,c.example",
+            }
+        )
+
+        expected = "a.example\nb.example\nc.example"
+        self.assertEqual(cfg["domain"], expected)
+        self.assertEqual(cfg["ti_temp_mail_domain"], expected)
+
     def test_adapter_does_not_reuse_moemail_credentials(self) -> None:
         import grok_build_adapter
         import register_lite_config
@@ -185,6 +219,26 @@ class TiTempMailTests(unittest.TestCase):
         self.assertIsNone(create.call_args.kwargs["api_key"])
         self.assertIsNone(create.call_args.kwargs["base_url"])
         self.assertEqual(create.call_args.kwargs["mailbox_mode"], "subdomain")
+
+    def test_adapter_passes_full_ti_domain_pool_to_request_layer(self) -> None:
+        import grok_build_adapter
+
+        mailbox = {
+            "id": "random@b.example",
+            "email": "random@b.example",
+            "token": "mailbox-token",
+            "selected_domain": "b.example",
+        }
+        with patch("moemail.create_mailbox", return_value=mailbox) as create:
+            grok_build_adapter._make_email_receiver(
+                mail_provider="ti-temp-mail",
+                domain="a.example;b.example,c.example",
+            )
+
+        self.assertEqual(
+            create.call_args.kwargs["domain"],
+            "a.example;b.example,c.example",
+        )
 
     def test_adapter_emits_ti_mail_poll_progress_without_tokens(self) -> None:
         import grok_build_adapter
