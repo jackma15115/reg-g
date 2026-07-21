@@ -2493,6 +2493,7 @@
           .replace(/TurnstileTaskProxyless:/ig, "")
           .replace(/YesCaptcha getTaskResult error:/ig, "")
           .replace(/ERROR_CAPTCHA_UNSOLVABLE: Workers could not solve the Captcha/ig, "本次过盾失败，请重试或更换代理出口。")
+          .replace(/ERROR_CAPTCHA_UNSOLVABLE:\s*/ig, "Camoufox 诊断：")
           .replace(/failed to verify Cloudflare turnstile token\.?/ig, "Cloudflare 过盾 token 校验失败（代理出口与过盾 IP 不一致、token 过期或并发过高）")
           .replace(/CreateSession 未返回 SSO/g, "密码登录未取得 SSO")
           .replace(/CreateSession/g, "密码登录")

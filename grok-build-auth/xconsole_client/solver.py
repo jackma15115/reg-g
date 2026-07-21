@@ -25,6 +25,7 @@ Task types:
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Callable, Optional
@@ -36,6 +37,18 @@ DEFAULT_ENDPOINTS = (
     "https://api.yescaptcha.com",
     "https://cn.yescaptcha.com",
 )
+
+
+def _solver_error_detail(data: dict) -> str:
+    code = str(data.get("errorCode") or "ERROR_UNKNOWN")
+    description = str(data.get("errorDescription") or "unknown solver error")
+    diagnostics = data.get("diagnostics")
+    if isinstance(diagnostics, dict) and diagnostics and "reason=" not in description:
+        compact = json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":"))
+        if len(compact) > 1200:
+            compact = compact[:1197] + "..."
+        description += f"; diagnostics={compact}"
+    return f"{code}: {description}"
 
 
 def resolve_yescaptcha_endpoint(explicit: str | None = None) -> str:
@@ -171,8 +184,7 @@ class YesCaptchaSolver:
 
             if data.get("errorId", 0) != 0:
                 raise RuntimeError(
-                    f"YesCaptcha getTaskResult error: "
-                    f"{data.get('errorCode')}: {data.get('errorDescription')}"
+                    "YesCaptcha getTaskResult error: " + _solver_error_detail(data)
                 )
 
             status = str(data.get("status") or "")
