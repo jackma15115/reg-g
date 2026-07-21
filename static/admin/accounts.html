@@ -2875,7 +2875,9 @@
           setValue("base_url", draft.base_url || "");
         }
         setValue("api_key", draft.api_key || "");
-        setValue("domain", draft.domain || "");
+        // Older backends stored domain pools newline-separated. A text input
+        // removes newlines, so restore them as visible separators first.
+        setValue("domain", String(draft.domain || "").replace(/[\r\n]+/g, ";"));
         setValue("mailbox_mode", draft.mailbox_mode || "maindomain");
         activeMailProvider = mail;
       }

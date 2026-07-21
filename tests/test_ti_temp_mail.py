@@ -191,9 +191,20 @@ class TiTempMailTests(unittest.TestCase):
             }
         )
 
-        expected = "a.example\nb.example\nc.example"
+        expected = "a.example;b.example,c.example"
         self.assertEqual(cfg["domain"], expected)
         self.assertEqual(cfg["ti_temp_mail_domain"], expected)
+
+    def test_registration_config_repairs_legacy_newline_domain_pool(self) -> None:
+        cfg = register_lite_store.normalize_registration_config(
+            {
+                "mail_provider": "ti-temp-mail",
+                "ti_temp_mail_domain": "a.example\nb.example\r\nc.example",
+            }
+        )
+
+        self.assertEqual(cfg["domain"], "a.example;b.example;c.example")
+        self.assertEqual(cfg["ti_temp_mail_domain"], "a.example;b.example;c.example")
 
     def test_adapter_does_not_reuse_moemail_credentials(self) -> None:
         import grok_build_adapter

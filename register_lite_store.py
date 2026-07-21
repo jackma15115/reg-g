@@ -1722,16 +1722,13 @@ def _normalize_domain_text(value: Any) -> str:
     raw = str(value or "")
     if not raw.strip():
         return ""
-    parts = re.split(r"[\s,;|]+", raw)
-    out: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        dom = part.strip().lstrip("@").strip(".").lower()
-        if not dom or dom in seen:
-            continue
-        seen.add(dom)
-        out.append(dom)
-    return "\n".join(out)
+    text = raw.strip()
+    # Domain fields use a single-line input. Preserve user-entered comma/
+    # semicolon separators; convert legacy newline-normalized values so browser
+    # value sanitization cannot collapse "a.com\nb.com" into "a.comb.com".
+    if "\n" in text or "\r" in text:
+        return ";".join(_domain_list_from_text(text))
+    return text
 
 
 def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -1824,8 +1821,9 @@ def normalize_registration_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         slot_val = api_key_val
     cfg["api_key"] = slot_val
     if "domain" in (raw or {}):
-        cfg[domain_slot] = _normalize_domain_text(cfg.get("domain"))
-    cfg["domain"] = _normalize_domain_text(cfg.get(domain_slot))
+        cfg[domain_slot] = cfg.get("domain")
+    cfg[domain_slot] = _normalize_domain_text(cfg.get(domain_slot))
+    cfg["domain"] = cfg[domain_slot]
 
     ti_mode = str(
         cfg.get("mailbox_mode") or cfg.get("ti_temp_mail_mode") or "maindomain"
