@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import gzip
 import io
+import time
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     from curl_cffi import requests as cc_requests  # type: ignore
@@ -40,6 +42,27 @@ DEFAULT_IMPERSONATE = "chrome145"
 DEFAULT_HTTP_VERSION = "v2"  # curl_cffi: "v2" or "v3" — accounts.x.ai serves HTTP/2
 DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 DEFAULT_JA3: Optional[str] = None  # let curl_cffi derive from impersonate target
+
+_SENSITIVE_QUERY_KEYS = {
+    "access_token", "authorization", "code", "id_token", "jwt",
+    "q", "refresh_token", "secret", "state", "token",
+}
+
+
+def redact_url(url: str) -> str:
+    """Keep request paths diagnosable without logging OAuth/session secrets."""
+    try:
+        parts = urlsplit(str(url))
+        query = urlencode([
+            (
+                key,
+                "<redacted>" if key.lower() in _SENSITIVE_QUERY_KEYS else value,
+            )
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ])
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
+    except Exception:
+        return str(url).split("#", 1)[0]
 
 
 class FingerprintTransport:
@@ -71,6 +94,7 @@ class FingerprintTransport:
         self._timeout = timeout
         self._debug = debug
         self._proxy = (proxy or "").strip() or None
+        self.last_request: Dict[str, object] = {}
         # A new Session per client. The browser-equivalent fingerprint is
         # established by `impersonate=`; it is fixed for the session's life.
         self._session = cc_requests.Session(
@@ -91,6 +115,15 @@ class FingerprintTransport:
     def request(
         self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
     ) -> Tuple[int, Dict[str, str], List[str], bytes]:
+        started = time.monotonic()
+        safe_url = redact_url(url)
+        self.last_request = {
+            "method": method,
+            "url": safe_url,
+            "started_at": started,
+            "timeout": self._timeout,
+            "proxy_enabled": bool(self._proxy),
+        }
         # curl_cffi lowercases keys on send; we don't rely on case here.
         merged: Dict[str, str] = {}
         # Surface order matters less than (a) presence, (b) Accept-Encoding order,
@@ -117,7 +150,26 @@ class FingerprintTransport:
         }
         if self._proxy:
             req_kwargs["proxies"] = {"http": self._proxy, "https": self._proxy}
-        resp = self._session.request(**req_kwargs)
+        if self._debug:
+            print(
+                f"  -> {method} {safe_url} timeout={self._timeout:.1f}s "
+                f"proxy={'on' if self._proxy else 'off'} "
+                f"impersonate={self._impersonate} http={self._http_version}",
+                flush=True,
+            )
+        try:
+            resp = self._session.request(**req_kwargs)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            message = (
+                f"curl request failed: {method} {safe_url}; "
+                f"elapsed={elapsed:.1f}s timeout={self._timeout:.1f}s "
+                f"proxy={'on' if self._proxy else 'off'}; {exc}"
+            )
+            self.last_request.update({"elapsed_sec": elapsed, "error": str(exc)})
+            if self._debug:
+                print(f"  !! {message}", flush=True)
+            raise RuntimeError(message) from exc
         status = resp.status_code
         raw = resp.content
         # Defensive: if server sent gzip but curl didn't decode, do it here.
@@ -132,9 +184,15 @@ class FingerprintTransport:
         raw_sc = resp.headers.get("set-cookie", "")
         set_cookies = _split_set_cookie(raw_sc) if raw_sc else []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
+        elapsed = time.monotonic() - started
+        self.last_request.update({"elapsed_sec": elapsed, "status": status, "bytes": len(raw)})
         if self._debug:
-            print(f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, "
-                  f"impersonate={self._impersonate}, http={self._http_version})")
+            print(
+                f"  <- {status} {method} {safe_url} elapsed={elapsed:.1f}s "
+                f"({len(raw)} bytes, {len(set_cookies)} set-cookie, "
+                f"impersonate={self._impersonate}, http={self._http_version})",
+                flush=True,
+            )
         return status, hdrs, set_cookies, raw
 
     @property

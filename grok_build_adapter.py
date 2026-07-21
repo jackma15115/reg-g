@@ -3414,7 +3414,21 @@ def _run_registration(
         return
     except Exception as exc:  # noqa: BLE001
         try:
-            update("error", f"failed: {exc}", error=str(exc))
+            # Preserve the last protocol request in the task record. This makes
+            # curl/libcurl failures actionable even when stdout is unavailable.
+            request_diag = dict(getattr(client, "last_request", {}) or {}) if client is not None else {}
+            phase = str(request_diag.get("phase") or "").strip()
+            request_url = str(request_diag.get("url") or "").strip()
+            elapsed = request_diag.get("elapsed_sec")
+            if phase and request_url and phase not in str(exc):
+                suffix = f" [last_request={phase} {request_url}"
+                if isinstance(elapsed, (int, float)):
+                    suffix += f" elapsed={float(elapsed):.1f}s"
+                suffix += "]"
+            else:
+                suffix = ""
+            detail = f"{exc}{suffix}"
+            update("error", f"failed: {detail}", error=detail, last_request=request_diag or None)
         except _RegCancelled:
             with _lock:
                 cur = _sessions.get(sid) or sess

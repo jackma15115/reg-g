@@ -42,11 +42,12 @@ import http.cookiejar
 import io
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from . import config as C
 from . import grpcweb
@@ -66,6 +67,7 @@ class _UrllibTransport:
     def __init__(self, *, timeout: float, debug: bool):
         self._timeout = timeout
         self._debug = debug
+        self.last_request: Dict[str, object] = {}
         self.cookies = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cookies),
@@ -73,6 +75,15 @@ class _UrllibTransport:
         )
 
     def request(self, method, url, *, headers, body=None):
+        started = time.monotonic()
+        safe_url = _redact_transport_url(url)
+        self.last_request = {
+            "method": method,
+            "url": safe_url,
+            "started_at": started,
+            "timeout": self._timeout,
+            "proxy_enabled": False,
+        }
         req = urllib.request.Request(url, data=body, method=method)
         for k, v in headers.items():
             req.add_header(k, v)
@@ -80,6 +91,16 @@ class _UrllibTransport:
             resp = self._opener.open(req, timeout=self._timeout)
         except urllib.error.HTTPError as e:
             resp = e
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            message = (
+                f"urllib request failed: {method} {safe_url}; "
+                f"elapsed={elapsed:.1f}s timeout={self._timeout:.1f}s; {exc}"
+            )
+            self.last_request.update({"elapsed_sec": elapsed, "error": str(exc)})
+            if self._debug:
+                print(f"  !! {message}", flush=True)
+            raise RuntimeError(message) from exc
         status = resp.getcode()
         raw = resp.read()
         if resp.headers.get("content-encoding", "").lower() == "gzip" and raw[:2] == b"\x1f\x8b":
@@ -89,11 +110,22 @@ class _UrllibTransport:
                 pass
         set_cookies = resp.headers.get_all("set-cookie") or []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
+        elapsed = time.monotonic() - started
+        self.last_request.update({"elapsed_sec": elapsed, "status": status, "bytes": len(raw)})
         if self._debug:
-            print(f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)")
+            print(f"  <- {status} {method} {safe_url} elapsed={elapsed:.1f}s ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)", flush=True)
         return status, hdrs, set_cookies, raw
 
     def close(self): pass
+
+
+def _redact_transport_url(url: str) -> str:
+    """Local fallback matching fingerprint transport URL redaction."""
+    try:
+        from .fingerprint import redact_url
+        return redact_url(url)
+    except Exception:
+        return str(url).split("#", 1)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +171,8 @@ class XConsoleAuthClient:
         # Password CreateSession is a fallback path. Keep its last upstream
         # result so callers can report a usable error instead of "no SSO".
         self.last_session_diagnostic: str = ""
+        self.last_request: Dict[str, object] = {}
+        self.last_request_error: str = ""
 
     def cookie_names(self) -> List[str]:
         """Return a list of cookie names currently held by the underlying transport."""
@@ -149,7 +183,48 @@ class XConsoleAuthClient:
 
     # ----------------------------------------------------------------- transport wrappers
     def _request(self, method, url, *, headers, body=None):
-        return self._t.request(method, url, headers=headers, body=body)
+        label = self._request_label(method, url)
+        try:
+            result = self._t.request(method, url, headers=headers, body=body)
+            self.last_request = dict(getattr(self._t, "last_request", {}) or {})
+            self.last_request["phase"] = label
+            self.last_request_error = ""
+            return result
+        except Exception as exc:
+            self.last_request = dict(getattr(self._t, "last_request", {}) or {})
+            self.last_request["phase"] = label
+            detail = f"{label}: {exc}"
+            self.last_request_error = detail
+            if self.debug:
+                print(f"  !! phase={label} {exc}", flush=True)
+            raise RuntimeError(detail) from exc
+
+    @staticmethod
+    def _request_label(method: str, url: str) -> str:
+        """Name protocol phases in errors so a raw curl error is actionable."""
+        path = urlsplit(str(url)).path.rstrip("/") or "/"
+        method = str(method).upper()
+        if method == "GET" and path == "/home":
+            return "visit_home"
+        if method == "GET" and path == "/sign-up":
+            return "signup_page"
+        if path.endswith("/CreateEmailValidationCode"):
+            return "create_email_code"
+        if path.endswith("/VerifyEmailValidationCode"):
+            return "verify_email_code"
+        if path.endswith("/ValidatePassword"):
+            return "validate_password"
+        if method == "POST" and path == "/sign-up":
+            return "create_account"
+        if path.endswith("/CreateSession"):
+            return "create_session"
+        if path.endswith("/CreateCookieSetterLink"):
+            return "create_cookie_setter_link"
+        if path.startswith("/oauth2/consent"):
+            return "oauth_consent"
+        if path.startswith("/oauth2/"):
+            return "oauth"
+        return f"{method} {path}"
 
     def _base_headers(self) -> Dict[str, str]:
         return {
