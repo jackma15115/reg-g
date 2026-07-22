@@ -118,9 +118,12 @@ start_inline_solver() {
   # Lazy browsers (default): pool warms on first captcha, reclaims after idle.
   export TURNSTILE_LAZY="${TURNSTILE_LAZY:-1}"
   export TURNSTILE_IDLE_SEC="${TURNSTILE_IDLE_SEC:-30}"
-  # Prefer native headless; only use Xvfb when explicitly requested.
+  # Camoufox selects its own ARM64 virtual display in auto mode. This external
+  # Xvfb switch remains available for diagnostics, but must launch Firefox in
+  # headed mode or it has no effect.
   use_xvfb="$(echo "${TURNSTILE_USE_XVFB:-0}" | tr '[:upper:]' '[:lower:]')"
-  echo "[entrypoint] starting inline turnstile-solver on ${solver_host}:${solver_port} (thread=${solver_thread}, browser=${solver_browser}, lazy=${TURNSTILE_LAZY}, idle=${TURNSTILE_IDLE_SEC}s, xvfb=${use_xvfb})"
+  display_mode="${TURNSTILE_CAMOUFOX_DISPLAY:-auto}"
+  echo "[entrypoint] starting inline turnstile-solver on ${solver_host}:${solver_port} (thread=${solver_thread}, browser=${solver_browser}, lazy=${TURNSTILE_LAZY}, idle=${TURNSTILE_IDLE_SEC}s, display=${display_mode}, xvfb=${use_xvfb})"
   mkdir -p /app/turnstile-solver/logs
   (
     cd /app/turnstile-solver
@@ -128,11 +131,12 @@ start_inline_solver() {
     # Do NOT require turnstile-solver/.venv (that is for bare-metal start.sh).
     if [[ "${use_xvfb}" == "1" || "${use_xvfb}" == "true" || "${use_xvfb}" == "yes" || "${use_xvfb}" == "on" ]]; then
       if command -v xvfb-run >/dev/null 2>&1 && command -v xauth >/dev/null 2>&1; then
-        exec xvfb-run -a python api_solver.py \
+        exec xvfb-run -a -s "-screen 0 1366x768x24" python api_solver.py \
           --browser_type "${solver_browser}" \
           --thread "${solver_thread}" \
           --host "${solver_host}" \
           --port "${solver_port}" \
+          --no-headless \
           --debug
       fi
       echo "[entrypoint] WARN: xvfb/xauth unavailable; falling back to native headless" >&2
