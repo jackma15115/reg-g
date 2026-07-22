@@ -77,6 +77,8 @@ def classify_turnstile_failure(error: str, diagnostics: dict[str, Any] | None) -
         return stage + "_failed"
     if stage == "page_navigation":
         return "target_page_navigation_failed"
+    if stage == "email_signup_navigation":
+        return "xai_email_signup_navigation_failed"
     if stage == "widget_injection" or "main-world Turnstile" in error:
         return "turnstile_main_world_injection_failed"
     if _as_int(diag.get("main_status")) >= 400:
@@ -186,6 +188,13 @@ def format_turnstile_failure(
         render_error = _clip(widget.get("render_error"), 220)
         if render_error:
             parts.append(f"render_error={render_error}")
+
+    email_signup = diag.get("email_signup") if isinstance(diag.get("email_signup"), dict) else {}
+    if email_signup:
+        parts.append(
+            "email_signup="
+            + _clip(json.dumps(email_signup, ensure_ascii=False, separators=(",", ":")), 520)
+        )
 
     for key, label in (
         ("request_failures", "request_failures"),

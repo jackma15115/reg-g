@@ -8,6 +8,7 @@ Does not depend on a full proxy PostgreSQL/Redis stack.
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
 import json
@@ -21,7 +22,7 @@ import subprocess
 import threading
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
@@ -2949,6 +2950,29 @@ async def export_sso_get(batch_id: str | None = None, status: str | None = None,
         download=bool(download),
     )
     return await export_sso(body)
+
+
+@app.get(_admin_path('api', 'accounts', 'register-email', 'export-credentials-csv'))
+async def export_credentials_csv():
+    rows = lite_store.export_account_credentials_rows()
+    if not rows:
+        raise HTTPException(status_code=404, detail="没有可导出的账号")
+
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(["email", "passwd"])
+    for row in rows:
+        writer.writerow([
+            str(row.get("email") or ""),
+            str(row.get("password") or ""),
+        ])
+
+    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return Response(
+        ("\ufeff" + output.getvalue()).encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="register-lite-accounts-{ts}.csv"'},
+    )
 
 
 @app.post(_admin_path('api', 'accounts', 'register-email', 'export-sso'))
