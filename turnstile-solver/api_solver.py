@@ -499,6 +499,10 @@ class TurnstileAPIServer:
                 # switch specifically for controlled iframe interactions.
                 disable_coop=True,
                 humanize=0.35,
+                # Camoufox isolates page.evaluate() by default. The solver must
+                # explicitly opt into main-world execution to mount the widget
+                # in the DOM that is actually painted and receives clicks.
+                main_world_eval=True,
                 debug=self.debug,
             )
             self._camoufox = camoufox
@@ -919,6 +923,19 @@ class TurnstileAPIServer:
         """)
 
 
+    def _main_world_script(self, script: str) -> str:
+        """Route DOM reads/writes to the real page when Camoufox isolation is active."""
+        return "mw:" + script if self.browser_type == "camoufox" else script
+
+
+    async def _evaluate_page(self, page, script: str):
+        return await page.evaluate(self._main_world_script(script))
+
+
+    async def _evaluate_page_handle(self, page, script: str):
+        return await page.evaluate_handle(self._main_world_script(script))
+
+
 
     @staticmethod
     def _remember_diagnostic(items: list, value: Any, *, limit: int = 8) -> None:
@@ -953,7 +970,8 @@ class TurnstileAPIServer:
         except Exception:
             pass
         try:
-            state = await page.evaluate(
+            state = await self._evaluate_page(
+                page,
                 """() => {
                     const shadowRoots = Array.from(window.__closedShadowRoots || []);
                     const roots = [document, ...shadowRoots];
@@ -984,6 +1002,10 @@ class TurnstileAPIServer:
                         token_value_lengths: inputs.map((el) => String(el.value || '').length),
                         viewport: {width: window.innerWidth, height: window.innerHeight},
                         challenge_scripts: scripts,
+                        solver_root_count: document.querySelectorAll('#__turnstileSolverRoot').length,
+                        solver_root_visible: Boolean(
+                            document.getElementById('__turnstileSolverRoot')?.getClientRects().length
+                        ),
                         widget: window.__turnstileDebug || null,
                     };
                 }"""
@@ -1000,6 +1022,8 @@ class TurnstileAPIServer:
                     "token_value_lengths",
                     "viewport",
                     "challenge_scripts",
+                    "solver_root_count",
+                    "solver_root_visible",
                 ):
                     if key in state:
                         diagnostics[key] = state[key]
@@ -1066,7 +1090,8 @@ class TurnstileAPIServer:
         """Click a Turnstile iframe rendered inside a closed shadow root."""
         handle = None
         try:
-            handle = await page.evaluate_handle(
+            handle = await self._evaluate_page_handle(
+                page,
                 """() => {
                     const roots = Array.from(window.__closedShadowRoots || []);
                     const isTurnstileFrame = (el) => {
@@ -1213,7 +1238,7 @@ class TurnstileAPIServer:
             ('shadow_iframe', lambda: self._click_shadow_turnstile(page, index)),
             ('checkbox_click', lambda: self._find_and_click_checkbox(page, index)),
             ('iframe_click', lambda: self._safe_click(page, 'iframe[src*="turnstile"]', index)),
-            ('js_click', lambda: page.evaluate("""() => {
+            ('js_click', lambda: self._evaluate_page(page, """() => {
                 const el = document.querySelector('.cf-turnstile');
                 if (!el) return false;
                 el.click();
@@ -1255,6 +1280,20 @@ class TurnstileAPIServer:
     async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
         """Inject CAPTCHA directly into the target website"""
         script = f"""
+        if (!window.__turnstileShadowCaptureInstalled) {{
+            const originalAttachShadow = Element.prototype.attachShadow;
+            window.__closedShadowRoots = [];
+            Element.prototype.attachShadow = function(init) {{
+                const shadow = originalAttachShadow.call(this, init);
+                if (init && init.mode === 'closed') {{
+                    window.__lastClosedShadowRoot = shadow;
+                    window.__closedShadowRoots.push(shadow);
+                }}
+                return shadow;
+            }};
+            window.__turnstileShadowCaptureInstalled = true;
+        }}
+
         window.__turnstileDebug = {{
             script_status: window.turnstile ? 'already_loaded' : 'not_loaded',
             render_status: 'not_started',
@@ -1294,6 +1333,7 @@ class TurnstileAPIServer:
             document.documentElement.appendChild(solverRoot);
         }}
         window.__turnstileDebug.isolated_root = true;
+        solverRoot.dataset.executionWorld = 'main';
         
         // Create turnstile widget directly on the page
         const captchaDiv = document.createElement('div');
@@ -1436,11 +1476,32 @@ class TurnstileAPIServer:
             window.__turnstileDebug.token_length = String(token || '').length;
             console.log('Global turnstile callback executed; token length:', window.__turnstileDebug.token_length);
         }};
+
         """
 
-        await page.evaluate(script)
+        await self._evaluate_page(page, script)
+        state = await self._evaluate_page(
+            page,
+            """() => {
+                const root = document.getElementById('__turnstileSolverRoot');
+                return {
+                    solver_root_count: document.querySelectorAll('#__turnstileSolverRoot').length,
+                    solver_root_visible: Boolean(root && root.getClientRects().length),
+                    execution_world: root?.dataset.executionWorld || '',
+                    body_child_count: document.body ? document.body.children.length : -1,
+                };
+            }""",
+        )
+        if not isinstance(state, dict) or state.get("solver_root_count") != 1:
+            raise RuntimeError(f"main-world Turnstile injection was not visible: {state!r}")
+        if not state.get("solver_root_visible"):
+            raise RuntimeError(f"main-world Turnstile root was not rendered: {state!r}")
         if self.debug:
-            logger.debug(f"Browser {index}: Injected CAPTCHA directly into website with sitekey: {websiteKey}")
+            logger.debug(
+                f"Browser {index}: Injected CAPTCHA in main world "
+                f"with sitekey={websiteKey} state={state}"
+            )
+        return state
 
     def _build_context_options(self, browser_config: dict, proxy: Optional[str] = None) -> dict:
         """Build browser context options with Camoufox-safe defaults."""
@@ -1449,6 +1510,10 @@ class TurnstileAPIServer:
         # Camoufox + newer Playwright rejects default viewport.isMobile scheme.
         # Always disable default viewport and set size after page creation.
         context_options["no_viewport"] = True
+        if self.browser_type == "camoufox":
+            # Main-world evaluation is required for the injected widget. Let
+            # Playwright execute it even when accounts.x.ai forbids unsafe-eval.
+            context_options["bypass_csp"] = True
 
         useragent = (browser_config or {}).get("useragent")
         if useragent:
@@ -1790,9 +1855,13 @@ class TurnstileAPIServer:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
                 stage = "widget_injection"
-                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+                injection_state = await self._inject_captcha_directly(
+                    page, sitekey, action or '', cdata or '', index
+                )
+                diagnostics["injection"] = injection_state
                 logger.info(
-                    f"Turnstile widget injected id={task_ref} browser_index={index}; waiting for token"
+                    f"Turnstile widget injected id={task_ref} browser_index={index} "
+                    f"world={injection_state.get('execution_world')}; waiting for token"
                 )
                 await asyncio.sleep(3)
 
