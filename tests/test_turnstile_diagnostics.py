@@ -90,28 +90,6 @@ class TurnstileDiagnosticTests(unittest.TestCase):
             "turnstile_token_timeout",
         )
 
-    def test_main_world_injection_failure_is_explicit(self) -> None:
-        diagnostics = {
-            "stage": "widget_injection",
-            "browser": "camoufox",
-            "solver_root_count": 0,
-            "solver_root_visible": False,
-        }
-
-        reason = classify_turnstile_failure(
-            "main-world Turnstile injection was not visible",
-            diagnostics,
-        )
-        rendered = format_turnstile_failure(
-            "main-world Turnstile injection was not visible",
-            8.5,
-            diagnostics,
-        )
-
-        self.assertEqual(reason, "turnstile_main_world_injection_failed")
-        self.assertIn("solver_roots=0", rendered)
-        self.assertIn("solver_root_visible=no", rendered)
-
     def test_solver_client_preserves_structured_diagnostics(self) -> None:
         detail = _solver_error_detail(
             {

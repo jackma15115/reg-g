@@ -77,8 +77,6 @@ def classify_turnstile_failure(error: str, diagnostics: dict[str, Any] | None) -
         return stage + "_failed"
     if stage == "page_navigation":
         return "target_page_navigation_failed"
-    if stage == "widget_injection" or "main-world Turnstile" in error:
-        return "turnstile_main_world_injection_failed"
     if _as_int(diag.get("main_status")) >= 400:
         return "target_page_http_error"
     if widget_errors:
@@ -159,12 +157,6 @@ def format_turnstile_failure(
         parts.append(f"closed_shadows={diag.get('closed_shadow_root_count')}")
     if diag.get("token_input_count") is not None:
         parts.append(f"token_inputs={diag.get('token_input_count')}")
-    if diag.get("solver_root_count") is not None:
-        parts.append(f"solver_roots={diag.get('solver_root_count')}")
-    if diag.get("solver_root_visible") is not None:
-        parts.append(
-            "solver_root_visible=" + ("yes" if diag.get("solver_root_visible") else "no")
-        )
     viewport = diag.get("viewport") if isinstance(diag.get("viewport"), dict) else {}
     if viewport:
         parts.append(f"viewport={viewport.get('width')}x{viewport.get('height')}")
