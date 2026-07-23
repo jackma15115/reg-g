@@ -94,43 +94,6 @@ def _package_version(name: str) -> Optional[str]:
         return None
 
 
-def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)) or default)
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))
-
-
-def _is_linux_arm64(machine: Optional[str] = None, system: Optional[str] = None) -> bool:
-    """Whether this is a native Linux ARM64 runtime (not an emulated x86 browser)."""
-    current_machine = (machine if machine is not None else platform.machine()).lower()
-    current_system = (system if system is not None else platform.system()).lower()
-    return current_system == "linux" and current_machine in {"aarch64", "arm64"}
-
-
-def _camoufox_display_mode(requested: Optional[str], *, headless: bool) -> str:
-    """Select a display mode without relying on Firefox's tiny headless window."""
-    mode = (requested or "auto").strip().lower()
-    aliases = {
-        "headless": "native",
-        "xvfb": "virtual",
-        "headful": "headed",
-    }
-    mode = aliases.get(mode, mode)
-    if mode in {"native", "virtual", "headed"}:
-        return mode
-    if mode not in {"", "auto"}:
-        logger.warning(
-            "Unknown TURNSTILE_CAMOUFOX_DISPLAY=%r; using auto" % requested
-        )
-    if not headless:
-        return "headed"
-    # ARM64 Firefox's native headless surface commonly remains 500x100. The
-    # bundled virtual-display path launches a normal browser window instead.
-    return "virtual" if _is_linux_arm64() else "native"
-
-
 def _elf_machine(path: Path) -> Optional[str]:
     """Return the ELF machine name without invoking the executable."""
     try:
@@ -292,12 +255,6 @@ class TurnstileAPIServer:
         self.browser_name = browser_name
         self.browser_version = browser_version
         self.console = Console()
-        self.viewport_width = _bounded_env_int("TURNSTILE_VIEWPORT_WIDTH", 1366, 800, 2560)
-        self.viewport_height = _bounded_env_int("TURNSTILE_VIEWPORT_HEIGHT", 768, 600, 1440)
-        self.camoufox_display_mode = _camoufox_display_mode(
-            os.getenv("TURNSTILE_CAMOUFOX_DISPLAY"),
-            headless=self.headless,
-        )
 
         # Lazy pool: do not keep Camoufox/Chromium warm while idle.
         # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
@@ -483,34 +440,8 @@ class TurnstileAPIServer:
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
-            launch_headless: Union[bool, str]
-            if self.camoufox_display_mode == "virtual":
-                launch_headless = "virtual"
-            elif self.camoufox_display_mode == "headed":
-                launch_headless = False
-            else:
-                launch_headless = True
-            camoufox = AsyncCamoufox(
-                headless=launch_headless,
-                # Keep physical and fingerprinted window geometry out of the
-                # Firefox headless 500x100 fallback, especially on ARM64.
-                window=(self.viewport_width, self.viewport_height),
-                # The Turnstile checkbox is cross-origin. Camoufox exposes this
-                # switch specifically for controlled iframe interactions.
-                disable_coop=True,
-                humanize=0.35,
-                debug=self.debug,
-            )
+            camoufox = AsyncCamoufox(headless=self.headless)
             self._camoufox = camoufox
-            logger.info(
-                "Camoufox launch mode=%s window=%sx%s machine=%s"
-                % (
-                    self.camoufox_display_mode,
-                    self.viewport_width,
-                    self.viewport_height,
-                    platform.machine() or "unknown",
-                )
-            )
 
         browser_configs = []
         for _ in range(self.thread_count):
@@ -906,12 +837,10 @@ class TurnstileAPIServer:
         await page.add_init_script("""
           (function() {
             const originalAttachShadow = Element.prototype.attachShadow;
-            window.__closedShadowRoots = [];
             Element.prototype.attachShadow = function(init) {
               const shadow = originalAttachShadow.call(this, init);
               if (init.mode === 'closed') {
                 window.__lastClosedShadowRoot = shadow;
-                window.__closedShadowRoots.push(shadow);
               }
               return shadow;
             };
@@ -919,6 +848,34 @@ class TurnstileAPIServer:
         """)
 
 
+
+    async def _optimized_route_handler(self, route):
+        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        url = route.request.url
+        resource_type = route.request.resource_type
+
+        allowed_types = {'document', 'script', 'xhr', 'fetch'}
+
+        allowed_domains = [
+            'challenges.cloudflare.com',
+            'static.cloudflareinsights.com',
+            'cloudflare.com'
+        ]
+        
+        if resource_type in allowed_types:
+            await route.continue_()
+        elif any(domain in url for domain in allowed_domains):
+            await route.continue_() 
+        else:
+            await route.abort()
+
+    async def _block_rendering(self, page):
+        """Блокировка рендеринга для экономии ресурсов"""
+        await page.route("**/*", self._optimized_route_handler)
+
+    async def _unblock_rendering(self, page):
+        """Разблокировка рендеринга"""
+        await page.unroute("**/*", self._optimized_route_handler)
 
     @staticmethod
     def _remember_diagnostic(items: list, value: Any, *, limit: int = 8) -> None:
@@ -955,20 +912,12 @@ class TurnstileAPIServer:
         try:
             state = await page.evaluate(
                 """() => {
-                    const shadowRoots = Array.from(window.__closedShadowRoots || []);
-                    const roots = [document, ...shadowRoots];
-                    const inputs = roots.flatMap((root) =>
-                        Array.from(root.querySelectorAll('input[name="cf-turnstile-response"]'))
-                    );
-                    const isTurnstileFrame = (el) => {
+                    const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'));
+                    const frames = Array.from(document.querySelectorAll('iframe')).filter((el) => {
                         const src = String(el.src || '');
                         const title = String(el.title || '').toLowerCase();
                         return src.includes('challenges.cloudflare.com') || src.includes('turnstile') || title.includes('turnstile');
-                    };
-                    const documentFrames = Array.from(document.querySelectorAll('iframe')).filter(isTurnstileFrame);
-                    const shadowFrames = shadowRoots.flatMap((root) =>
-                        Array.from(root.querySelectorAll('iframe')).filter(isTurnstileFrame)
-                    );
+                    });
                     const scripts = Array.from(document.scripts)
                         .map((el) => String(el.src || ''))
                         .filter((src) => src.includes('challenges.cloudflare.com'))
@@ -976,10 +925,7 @@ class TurnstileAPIServer:
                     return {
                         ready_state: document.readyState,
                         turnstile_available: Boolean(window.turnstile && window.turnstile.render),
-                        iframe_count: documentFrames.length + shadowFrames.length,
-                        document_iframe_count: documentFrames.length,
-                        shadow_iframe_count: shadowFrames.length,
-                        closed_shadow_root_count: shadowRoots.length,
+                        iframe_count: frames.length,
                         token_input_count: inputs.length,
                         token_value_lengths: inputs.map((el) => String(el.value || '').length),
                         viewport: {width: window.innerWidth, height: window.innerHeight},
@@ -993,9 +939,6 @@ class TurnstileAPIServer:
                     "ready_state",
                     "turnstile_available",
                     "iframe_count",
-                    "document_iframe_count",
-                    "shadow_iframe_count",
-                    "closed_shadow_root_count",
                     "token_input_count",
                     "token_value_lengths",
                     "viewport",
@@ -1013,18 +956,11 @@ class TurnstileAPIServer:
         if enabled in ("0", "false", "no", "off") or page is None:
             return ""
         base = os.getenv("TURNSTILE_DIAGNOSTICS_DIR", "").strip()
-        data_dir = os.getenv("GROK_REGISTER_LITE_DATA_DIR", "").strip()
-        directory = (
-            Path(base)
-            if base
-            else Path(data_dir) / "turnstile_diagnostics"
-            if data_dir
-            else Path(__file__).resolve().parent / "logs" / "diagnostics"
-        )
+        directory = Path(base) if base else Path(__file__).resolve().parent / "logs" / "diagnostics"
         try:
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"turnstile-{task_ref}-{int(time.time())}.png"
-            await page.screenshot(path=str(path), full_page=False)
+            await page.screenshot(path=str(path), full_page=True)
             return str(path)
         except Exception as exc:
             logger.warning(f"Turnstile failure screenshot failed id={task_ref}: {exc}")
@@ -1061,66 +997,6 @@ class TurnstileAPIServer:
                 continue
         
         return elements
-
-    async def _click_shadow_turnstile(self, page, index: int) -> bool:
-        """Click a Turnstile iframe rendered inside a closed shadow root."""
-        handle = None
-        try:
-            handle = await page.evaluate_handle(
-                """() => {
-                    const roots = Array.from(window.__closedShadowRoots || []);
-                    const isTurnstileFrame = (el) => {
-                        const src = String(el.src || '');
-                        const title = String(el.title || '').toLowerCase();
-                        return src.includes('challenges.cloudflare.com') ||
-                            src.includes('turnstile') || title.includes('turnstile');
-                    };
-                    for (const root of roots) {
-                        const frame = Array.from(root.querySelectorAll('iframe')).find(isTurnstileFrame);
-                        if (frame) return frame;
-                    }
-                    return null;
-                }"""
-            )
-            iframe_element = handle.as_element() if handle is not None else None
-            if iframe_element is None:
-                return False
-
-            frame = await iframe_element.content_frame()
-            if frame is not None:
-                for selector in (
-                    'input[type="checkbox"]',
-                    '.cb-lb input[type="checkbox"]',
-                    'label.cb-lb',
-                    '.cb-lb',
-                ):
-                    try:
-                        await frame.locator(selector).first.click(timeout=1500)
-                        if self.debug:
-                            logger.debug(
-                                f"Browser {index}: clicked closed-shadow Turnstile via {selector}"
-                            )
-                        return True
-                    except Exception:
-                        continue
-
-            # Cross-origin frame internals can be opaque. Click the checkbox
-            # area relative to the iframe instead of treating container clicks
-            # or JavaScript undefined as success.
-            await iframe_element.click(position={"x": 32, "y": 32}, timeout=2000)
-            if self.debug:
-                logger.debug(f"Browser {index}: clicked closed-shadow Turnstile iframe at 32,32")
-            return True
-        except Exception as exc:
-            if self.debug:
-                logger.debug(f"Browser {index}: closed-shadow Turnstile click failed: {exc}")
-            return False
-        finally:
-            if handle is not None:
-                try:
-                    await handle.dispose()
-                except Exception:
-                    pass
 
     async def _find_and_click_checkbox(self, page, index: int):
         """Найти и кликнуть по чекбоксу Turnstile CAPTCHA внутри iframe"""
@@ -1163,9 +1039,7 @@ class TurnstileAPIServer:
                         checkbox_selectors = [
                             'input[type="checkbox"]',
                             '.cb-lb input[type="checkbox"]',
-                            'label input[type="checkbox"]',
-                            'label.cb-lb',
-                            '.cb-lb',
+                            'label input[type="checkbox"]'
                         ]
                         
                         for selector in checkbox_selectors:
@@ -1192,7 +1066,7 @@ class TurnstileAPIServer:
                         try:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
-                            await iframe_locator.click(position={"x": 32, "y": 32}, timeout=1500)
+                            await iframe_locator.click(timeout=1000)
                             return True
                         except Exception as e:
                             if self.debug:
@@ -1210,16 +1084,10 @@ class TurnstileAPIServer:
 
     async def _try_click_strategies(self, page, index: int):
         strategies = [
-            ('shadow_iframe', lambda: self._click_shadow_turnstile(page, index)),
             ('checkbox_click', lambda: self._find_and_click_checkbox(page, index)),
-            ('iframe_click', lambda: self._safe_click(page, 'iframe[src*="turnstile"]', index)),
-            ('js_click', lambda: page.evaluate("""() => {
-                const el = document.querySelector('.cf-turnstile');
-                if (!el) return false;
-                el.click();
-                return true;
-            }""")),
             ('direct_widget', lambda: self._safe_click(page, '.cf-turnstile', index)),
+            ('iframe_click', lambda: self._safe_click(page, 'iframe[src*="turnstile"]', index)),
+            ('js_click', lambda: page.evaluate("document.querySelector('.cf-turnstile')?.click()")),
             ('sitekey_attr', lambda: self._safe_click(page, '[data-sitekey]', index)),
             ('any_turnstile', lambda: self._safe_click(page, '*[class*="turnstile"]', index)),
             ('xpath_click', lambda: self._safe_click(page, "//div[@class='cf-turnstile']", index))
@@ -1228,16 +1096,16 @@ class TurnstileAPIServer:
         for strategy_name, strategy_func in strategies:
             try:
                 result = await strategy_func()
-                if result is True:
+                if result is True or result is None:  # None означает успех для большинства стратегий
                     if self.debug:
                         logger.debug(f"Browser {index}: Click strategy '{strategy_name}' succeeded")
-                    return strategy_name
+                    return True
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: Click strategy '{strategy_name}' failed: {str(e)}")
                 continue
         
-        return ""
+        return False
 
     async def _safe_click(self, page, selector: str, index: int):
         """Полностью безопасный клик с максимальной защитой от ошибок"""
@@ -1265,35 +1133,6 @@ class TurnstileAPIServer:
         // Remove any existing turnstile widgets first
         document.querySelectorAll('.cf-turnstile').forEach(el => el.remove());
         document.querySelectorAll('[data-sitekey]').forEach(el => el.remove());
-
-        const previousRoot = document.getElementById('__turnstileSolverRoot');
-        if (previousRoot) previousRoot.remove();
-        const solverRoot = document.createElement('div');
-        solverRoot.id = '__turnstileSolverRoot';
-        solverRoot.style.position = 'fixed';
-        solverRoot.style.inset = '0';
-        solverRoot.style.width = '100vw';
-        solverRoot.style.height = '100vh';
-        solverRoot.style.zIndex = '2147483647';
-        solverRoot.style.isolation = 'isolate';
-        solverRoot.style.display = 'flex';
-        solverRoot.style.alignItems = 'flex-start';
-        solverRoot.style.justifyContent = 'flex-start';
-        solverRoot.style.boxSizing = 'border-box';
-        solverRoot.style.padding = '8px';
-        solverRoot.style.background = '#ffffff';
-        solverRoot.style.colorScheme = 'light';
-        solverRoot.style.pointerEvents = 'auto';
-        if (document.body) {{
-            document.body.replaceChildren(solverRoot);
-            document.body.style.margin = '0';
-            document.body.style.padding = '0';
-            document.body.style.overflow = 'hidden';
-            document.body.style.background = '#ffffff';
-        }} else {{
-            document.documentElement.appendChild(solverRoot);
-        }}
-        window.__turnstileDebug.isolated_root = true;
         
         // Create turnstile widget directly on the page
         const captchaDiv = document.createElement('div');
@@ -1302,18 +1141,18 @@ class TurnstileAPIServer:
         captchaDiv.setAttribute('data-callback', 'onTurnstileCallback');
         {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
         {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
-        captchaDiv.style.position = 'relative';
-        captchaDiv.style.zIndex = '1';
-        captchaDiv.style.width = '320px';
-        captchaDiv.style.minHeight = '65px';
+        captchaDiv.style.position = 'fixed';
+        captchaDiv.style.top = '20px';
+        captchaDiv.style.left = '20px';
+        captchaDiv.style.zIndex = '9999';
         captchaDiv.style.backgroundColor = 'white';
-        captchaDiv.style.padding = '8px';
+        captchaDiv.style.padding = '15px';
         captchaDiv.style.border = '2px solid #0f79af';
         captchaDiv.style.borderRadius = '8px';
         captchaDiv.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.3)';
         
-        // Add to an isolated top layer so site cookies/layout cannot cover it.
-        solverRoot.appendChild(captchaDiv);
+        // Add to body immediately
+        document.body.appendChild(captchaDiv);
         
         // Load Turnstile script and render widget
         const loadTurnstile = () => {{
@@ -1332,8 +1171,6 @@ class TurnstileAPIServer:
                             window.__turnstileDebug.render_status = 'rendering';
                             window.turnstile.render(captchaDiv, {{
                                 sitekey: '{websiteKey}',
-                                theme: 'light',
-                                appearance: 'always',
                                 {f'action: "{action}",' if action else ''}
                                 {f'cdata: "{cdata}",' if cdata else ''}
                                 callback: function(token) {{
@@ -1390,8 +1227,6 @@ class TurnstileAPIServer:
                 window.__turnstileDebug.render_status = 'rendering';
                 window.turnstile.render(captchaDiv, {{
                     sitekey: '{websiteKey}',
-                    theme: 'light',
-                    appearance: 'always',
                     {f'action: "{action}",' if action else ''}
                     {f'cdata: "{cdata}",' if cdata else ''}
                     callback: function(token) {{
@@ -1550,19 +1385,13 @@ class TurnstileAPIServer:
             "target_host": target_host,
             "target_url": url,
             "browser": self.browser_type,
-            "machine": platform.machine() or "unknown",
-            "camoufox_display_mode": (
-                self.camoufox_display_mode if self.browser_type == "camoufox" else None
-            ),
             "proxy": bool(proxy),
-            "resource_blocking": False,
             "sitekey_prefix": str(sitekey or "")[:12],
             "action_present": bool(action),
             "cdata_present": bool(cdata),
             "request_failures": [],
             "http_errors": [],
             "console_errors": [],
-            "click_attempts": [],
         }
 
         async def record_failure(error: str) -> None:
@@ -1686,8 +1515,6 @@ class TurnstileAPIServer:
                     kind = str(getattr(message, "type", "") or "")
                     body = str(getattr(message, "text", "") or "")
                     lowered = body.lower()
-                    if kind == "warning" and "strict-dynamic" in lowered and "ignoring" in lowered:
-                        return
                     if kind in {"error", "warning"} or any(
                         marker in lowered for marker in ("turnstile error", "render error", "failed to load")
                     ):
@@ -1710,15 +1537,12 @@ class TurnstileAPIServer:
             def on_request_failed(failed_request) -> None:
                 try:
                     failed_url = str(getattr(failed_request, "url", "") or "")
-                    if "challenges.cloudflare.com" in failed_url.lower():
+                    if self._is_diagnostic_request(failed_url):
                         self._remember_diagnostic(
                             diagnostics["request_failures"],
                             {
                                 "url": failed_url[:300],
                                 "failure": str(getattr(failed_request, "failure", "") or "")[:220],
-                                "resource_type": str(
-                                    getattr(failed_request, "resource_type", "") or ""
-                                )[:40],
                             },
                         )
                 except Exception:
@@ -1741,21 +1565,24 @@ class TurnstileAPIServer:
             page.on("requestfailed", on_request_failed)
             page.on("response", on_response)
 
-            if self.browser_type != "camoufox":
-                try:
-                    await page.set_viewport_size(
-                        {"width": self.viewport_width, "height": self.viewport_height}
-                    )
-                except Exception:
-                    pass
+            try:
+                await page.set_viewport_size({"width": 500, "height": 100})
+            except Exception:
+                pass
 
             await self._antishadow_inject(page)
-            if self.browser_type != "camoufox":
-                await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-            });
-            """)
+            await self._block_rendering(page)
+            await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+        };
+        """)
 
             try:
                 if self.debug:
@@ -1763,10 +1590,7 @@ class TurnstileAPIServer:
                         f"Browser {index}: Starting Turnstile solve task={task_ref} "
                         f"host={target_host} proxy={'yes' if proxy else 'no'}"
                     )
-                    logger.debug(
-                        f"Browser {index}: Loading full page resources at "
-                        f"{self.viewport_width}x{self.viewport_height}"
-                    )
+                    logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
                     logger.debug(f"Browser {index}: Loading target host: {target_host}")
 
                 stage = "page_navigation"
@@ -1785,6 +1609,7 @@ class TurnstileAPIServer:
                 logger.info(
                     f"Turnstile page loaded id={task_ref} browser_index={index} host={target_host}"
                 )
+                await self._unblock_rendering(page)
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
@@ -1848,22 +1673,11 @@ class TurnstileAPIServer:
                                     continue
 
                         if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
-                            click_strategy = await self._try_click_strategies(page, index)
+                            click_success = await self._try_click_strategies(page, index)
                             click_count += 1
-                            self._remember_diagnostic(
-                                diagnostics["click_attempts"],
-                                {
-                                    "attempt": attempt + 1,
-                                    "strategy": click_strategy or "none",
-                                },
-                                limit=max_clicks,
-                            )
-                            if click_strategy and self.debug:
-                                logger.debug(
-                                    f"Browser {index}: Click strategy={click_strategy} "
-                                    f"(click #{click_count}/{max_clicks})"
-                                )
-                            elif not click_strategy and self.debug:
+                            if click_success and self.debug:
+                                logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
+                            elif not click_success and self.debug:
                                 logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
                         wait_time = min(0.5 + (attempt * 0.05), 2.0)

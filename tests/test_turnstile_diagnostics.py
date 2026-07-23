@@ -27,10 +27,7 @@ class TurnstileDiagnosticTests(unittest.TestCase):
             "ready_state": "complete",
             "turnstile_available": True,
             "iframe_count": 1,
-            "shadow_iframe_count": 1,
-            "closed_shadow_root_count": 2,
             "token_input_count": 1,
-            "click_attempts": [{"attempt": 4, "strategy": "shadow_iframe"}],
             "widget": {
                 "script_status": "loaded",
                 "render_status": "rendered",
@@ -47,8 +44,6 @@ class TurnstileDiagnosticTests(unittest.TestCase):
         self.assertIn("main_http=200", rendered)
         self.assertIn("widget_errors=[\"110200\"]", rendered)
         self.assertIn("unknown_domain_for_sitekey", rendered)
-        self.assertIn("shadow_iframes=1", rendered)
-        self.assertIn("click_attempts", rendered)
         self.assertEqual(turnstile_error_hint("110510"), "inconsistent_user_agent")
 
     def test_cloudflare_request_failure_takes_priority_over_missing_script(self) -> None:
@@ -68,26 +63,6 @@ class TurnstileDiagnosticTests(unittest.TestCase):
         self.assertEqual(
             classify_turnstile_failure("timeout_waiting_for_token", diagnostics),
             "turnstile_network_failed",
-        )
-
-    def test_cancelled_cloudflare_request_is_not_reported_as_network_failure(self) -> None:
-        diagnostics = {
-            "stage": "token_wait",
-            "turnstile_available": True,
-            "iframe_count": 1,
-            "token_input_count": 1,
-            "request_failures": [
-                {
-                    "url": "https://challenges.cloudflare.com/turnstile/v0/example",
-                    "failure": "NS_ERROR_ABORT",
-                }
-            ],
-            "widget": {"script_status": "loaded", "render_status": "rendered"},
-        }
-
-        self.assertEqual(
-            classify_turnstile_failure("timeout_waiting_for_token", diagnostics),
-            "turnstile_token_timeout",
         )
 
     def test_solver_client_preserves_structured_diagnostics(self) -> None:

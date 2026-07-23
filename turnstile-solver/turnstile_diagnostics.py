@@ -83,17 +83,7 @@ def classify_turnstile_failure(error: str, diagnostics: dict[str, Any] | None) -
         return "turnstile_widget_error"
 
     failures = diag.get("request_failures") if isinstance(diag.get("request_failures"), list) else []
-    substantive_challenge_failures = []
-    for item in failures:
-        item_url = str(item.get("url") or "") if isinstance(item, dict) else str(item)
-        failure = str(item.get("failure") or "") if isinstance(item, dict) else str(item)
-        lowered_failure = failure.lower()
-        if "challenges.cloudflare.com" not in item_url:
-            continue
-        if any(marker in lowered_failure for marker in ("ns_error_abort", "cancelled", "canceled")):
-            continue
-        substantive_challenge_failures.append(item)
-    if substantive_challenge_failures:
+    if any("challenges.cloudflare.com" in str(item) for item in failures):
         return "turnstile_network_failed"
 
     script_status = str(widget.get("script_status") or "") if isinstance(widget, dict) else ""
@@ -127,10 +117,6 @@ def format_turnstile_failure(
         parts.append(f"elapsed={float(elapsed_time):.1f}s")
     if diag.get("browser"):
         parts.append(f"browser={_clip(diag.get('browser'), 60)}")
-    if diag.get("machine"):
-        parts.append(f"machine={_clip(diag.get('machine'), 60)}")
-    if diag.get("camoufox_display_mode"):
-        parts.append(f"display={_clip(diag.get('camoufox_display_mode'), 40)}")
     if diag.get("proxy") is not None:
         parts.append("proxy=" + ("yes" if diag.get("proxy") else "no"))
     if diag.get("sitekey_prefix"):
@@ -151,10 +137,6 @@ def format_turnstile_failure(
         parts.append("turnstile_api=" + ("yes" if diag.get("turnstile_available") else "no"))
     if diag.get("iframe_count") is not None:
         parts.append(f"iframes={diag.get('iframe_count')}")
-    if diag.get("shadow_iframe_count") is not None:
-        parts.append(f"shadow_iframes={diag.get('shadow_iframe_count')}")
-    if diag.get("closed_shadow_root_count") is not None:
-        parts.append(f"closed_shadows={diag.get('closed_shadow_root_count')}")
     if diag.get("token_input_count") is not None:
         parts.append(f"token_inputs={diag.get('token_input_count')}")
     viewport = diag.get("viewport") if isinstance(diag.get("viewport"), dict) else {}
@@ -183,7 +165,6 @@ def format_turnstile_failure(
         ("request_failures", "request_failures"),
         ("http_errors", "http_errors"),
         ("console_errors", "console_errors"),
-        ("click_attempts", "click_attempts"),
     ):
         event_text = _event_text(diag.get(key))
         if event_text:
