@@ -112,32 +112,6 @@ class TurnstileDiagnosticTests(unittest.TestCase):
         self.assertIn("solver_roots=0", rendered)
         self.assertIn("solver_root_visible=no", rendered)
 
-    def test_email_signup_navigation_failure_is_explicit(self) -> None:
-        diagnostics = {
-            "stage": "email_signup_navigation",
-            "page_url": "https://accounts.x.ai/sign-up?redirect=cloud-console",
-            "email_signup": {
-                "ok": False,
-                "required": True,
-                "status": "email_entry_not_found",
-                "before": {
-                    "email_form_visible": False,
-                    "email_choice_visible": False,
-                },
-            },
-        }
-
-        reason = classify_turnstile_failure("x.ai email signup navigation failed", diagnostics)
-        rendered = format_turnstile_failure(
-            "x.ai email signup navigation failed",
-            5.0,
-            diagnostics,
-        )
-
-        self.assertEqual(reason, "xai_email_signup_navigation_failed")
-        self.assertIn("email_signup=", rendered)
-        self.assertIn("email_entry_not_found", rendered)
-
     def test_solver_client_preserves_structured_diagnostics(self) -> None:
         detail = _solver_error_detail(
             {

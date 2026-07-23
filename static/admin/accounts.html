@@ -1565,7 +1565,6 @@
               <button id="export-accounts" class="btn" type="button">导出</button>
               <button id="export-sso-accounts" class="btn" type="button" title="导出纯 SSO，每行一个">导出 SSO</button>
               <button id="export-cpa-accounts" class="btn" type="button">导出 CPA</button>
-              <button id="export-credentials-csv" class="btn" type="button" title="导出全部账号，CSV 列为 email、passwd">导出账号 CSV</button>
             </div>
             <div class="pager-actions">
               <span id="selected-count" class="badge">已选：0</span>
@@ -4700,10 +4699,6 @@
         window.location.href = __adminUrl("api", "accounts", "register-email", "export-cpa-zip") + "?limit=5000";
       }
 
-      function exportCredentialsCsv() {
-        window.location.href = __adminUrl("api", "accounts", "register-email", "export-credentials-csv");
-      }
-
       function changeAccountsPage(page) {
         accountState.page = Math.max(1, Math.min(accountState.totalPages || 1, page));
         clearFreezeOrder();
@@ -5173,7 +5168,6 @@
         bind("export-accounts", "click", exportAccounts);
         bind("export-sso-accounts", "click", exportSsoAccounts);
         bind("export-cpa-accounts", "click", exportCpaAccounts);
-        bind("export-credentials-csv", "click", exportCredentialsCsv);
         bind("theme-toggle", "click", toggleTheme);
         applyTheme(currentTheme());
         bind("logout-btn", "click", logout);

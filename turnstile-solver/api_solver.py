@@ -20,7 +20,6 @@ from patchright.async_api import async_playwright
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
 from turnstile_diagnostics import classify_turnstile_failure, format_turnstile_failure
-from xai_signup_navigation import enter_xai_email_signup
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -1325,10 +1324,7 @@ class TurnstileAPIServer:
         solverRoot.style.colorScheme = 'light';
         solverRoot.style.pointerEvents = 'auto';
         if (document.body) {{
-            // Keep the x.ai email sign-up React tree alive. Replacing every
-            // body child lets the SPA reconcile back to the provider chooser
-            // and can remove this solver root while the challenge is running.
-            document.body.appendChild(solverRoot);
+            document.body.replaceChildren(solverRoot);
             document.body.style.margin = '0';
             document.body.style.padding = '0';
             document.body.style.overflow = 'hidden';
@@ -1854,19 +1850,6 @@ class TurnstileAPIServer:
                 logger.info(
                     f"Turnstile page loaded id={task_ref} browser_index={index} host={target_host}"
                 )
-
-                stage = "email_signup_navigation"
-                email_signup = await enter_xai_email_signup(page, self._evaluate_page)
-                diagnostics["email_signup"] = email_signup
-                diagnostics["page_url"] = str(page.url or "")
-                if not email_signup.get("ok"):
-                    status = str(email_signup.get("status") or "unknown")
-                    raise RuntimeError(f"x.ai email signup navigation failed: {status}")
-                if email_signup.get("required"):
-                    logger.info(
-                        f"x.ai email signup ready id={task_ref} browser_index={index} "
-                        f"status={email_signup.get('status')} strategy={email_signup.get('click_strategy') or 'none'}"
-                    )
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")

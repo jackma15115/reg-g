@@ -5349,16 +5349,6 @@ def export_sso_rows(*, batch_id: str = "", status: list[str] | None = None) -> l
     return [dict(r) for r in rows]
 
 
-def export_account_credentials_rows() -> list[dict[str, Any]]:
-    """Return every locally stored account for the credentials CSV export."""
-    init_db()
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT email, password FROM accounts ORDER BY email COLLATE NOCASE ASC"
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
 def _probe_body(model: str) -> dict[str, Any]:
     return {
         "model": model,
