@@ -83,6 +83,59 @@ class RegistrationTargetTests(unittest.TestCase):
         self.assertEqual(stats["remaining_success"], 2)
         self.assertEqual(stats["batch_status"], "running")
 
+    def test_auth_failure_preserves_sso_credentials_and_counts_as_success(self) -> None:
+        session_id = self._session("importing")
+        with grok_build_adapter._lock:
+            session = grok_build_adapter._sessions[session_id]
+            session.update(
+                {
+                    "email": "partial@example.test",
+                    "password": "secret-password",
+                    "sso": "sso-token",
+                }
+            )
+
+        class Accounts:
+            records = []
+
+            @classmethod
+            def import_local_credentials(cls, records, *, source):
+                cls.records.extend(records)
+                return {"ok": True, "created": 1, "updated": 0, "source": source}
+
+        def update(status, message, **kwargs):
+            with grok_build_adapter._lock:
+                current = grok_build_adapter._sessions[session_id]
+                current.update(kwargs)
+                current["status"] = status
+                current["message"] = message
+
+        grok_build_adapter._complete_sso_only_registration(
+            sess=session,
+            email="partial@example.test",
+            password="secret-password",
+            sso="sso-token",
+            accounts=Accounts,
+            update=update,
+            auth_error=RuntimeError("device flow timed out"),
+        )
+
+        with grok_build_adapter._lock:
+            completed = dict(grok_build_adapter._sessions[session_id])
+        stats = grok_build_adapter._batch_stats([session_id], batch={"count": 1})
+
+        self.assertEqual(
+            Accounts.records,
+            [{"email": "partial@example.test", "password": "secret-password", "sso": "sso-token"}],
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["partial_auth"])
+        self.assertIsNone(completed["error"])
+        self.assertEqual(completed["imported_accounts"][0]["email"], "partial@example.test")
+        self.assertEqual(stats["imported"], 1)
+        self.assertEqual(stats["error"], 0)
+        self.assertEqual(stats["remaining_success"], 0)
+
     def test_runner_replenishes_failed_attempts_without_overshooting(self) -> None:
         batch_id = f"batch_test_{uuid.uuid4().hex}"
         self.batch_ids.append(batch_id)

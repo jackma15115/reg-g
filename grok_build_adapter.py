@@ -2488,6 +2488,51 @@ def _registration_failure_detail(exc: Exception, client: Any) -> tuple[str, dict
     return message, request_diag or None
 
 
+def _complete_sso_only_registration(
+    *,
+    sess: dict[str, Any],
+    email: str,
+    password: str,
+    sso: str,
+    accounts: Any,
+    update: Any,
+    auth_error: Exception,
+) -> dict[str, Any]:
+    """Keep a registered account when only OAuth/Auth extraction failed."""
+    result = accounts.import_local_credentials(
+        [{"email": email, "password": password, "sso": sso}],
+        source="registration_auth_partial",
+    )
+    preserved = int(result.get("created") or 0) + int(result.get("updated") or 0)
+    if not result.get("ok") or preserved < 1:
+        raise RuntimeError(
+            "Auth extraction failed and SSO credentials could not be preserved: "
+            f"{result.get('error') or 'account was skipped'}"
+        ) from auth_error
+
+    account_id = f"local::{email}"
+    warning = str(auth_error or "Auth extraction failed")[:800]
+    imported_accounts = [{"id": account_id, "email": email}]
+    sess["auth_json"] = None
+    sess["imported_account_ids"] = [account_id]
+    sess["imported_accounts"] = imported_accounts
+    sess["oauth"] = {"path": "sso_only", "email": email, "error": warning}
+    sess["partial_auth"] = True
+    sess["auth_extraction_error"] = warning
+    update(
+        "completed",
+        "账号已注册并保留；Auth 提取失败，SSO/账号密码仍可导出。",
+        error=None,
+        warning=warning,
+        partial_auth=True,
+        auth_extraction_error=warning,
+        imported_account_ids=[account_id],
+        imported_accounts=imported_accounts,
+        probe={"count": 0, "ok": 0, "fail": 0, "results": []},
+    )
+    return result
+
+
 def _run_registration(
     sid: str,
     yescaptcha_key: str,
@@ -3147,38 +3192,53 @@ def _run_registration(
         )
         import sso_to_auth_json as sso_import
 
-        token = sso_import.sso_to_token(sso)
-        if not token or not token.get("access_token"):
-            _note_reg_pressure("device-flow conversion failed", pause_sec=10)
-            raise RuntimeError(
-                "SSO obtained but sso_to_auth_json conversion failed "
-                "(device verify/approve/token poll; often xAI device-flow "
-                "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+        try:
+            token = sso_import.sso_to_token(sso)
+            if not token or not token.get("access_token"):
+                _note_reg_pressure("device-flow conversion failed", pause_sec=10)
+                raise RuntimeError(
+                    "SSO obtained but sso_to_auth_json conversion failed "
+                    "(device verify/approve/token poll; often xAI device-flow "
+                    "rate_limited/slow_down under concurrent registration). "
+                    f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+                )
+            _key, entry = sso_import.token_to_auth_entry(token, email=email)
+            import_result = accounts.import_auth_payload(
+                {
+                    "key": entry["key"],
+                    "auth_mode": entry.get("auth_mode", "oidc"),
+                    "email": entry.get("email") or email,
+                    "refresh_token": entry.get("refresh_token", ""),
+                    "id_token": token.get("id_token", ""),
+                    "expires_at": entry.get("expires_at"),
+                    "oidc_issuer": entry.get("oidc_issuer", "https://auth.x.ai"),
+                    "oidc_client_id": entry.get("oidc_client_id", ""),
+                    "registration_password": password,
+                    "sso": sso,
+                    "batch_id": sess.get("batch_id") or "",
+                    "session_id": sid,
+                },
+                merge=True,
             )
-        _key, entry = sso_import.token_to_auth_entry(token, email=email)
-        import_result = accounts.import_auth_payload(
-            {
-                "key": entry["key"],
-                "auth_mode": entry.get("auth_mode", "oidc"),
-                "email": entry.get("email") or email,
-                "refresh_token": entry.get("refresh_token", ""),
-                "id_token": token.get("id_token", ""),
-                "expires_at": entry.get("expires_at"),
-                "oidc_issuer": entry.get("oidc_issuer", "https://auth.x.ai"),
-                "oidc_client_id": entry.get("oidc_client_id", ""),
-                "registration_password": password,
-                "sso": sso,
-                "batch_id": sess.get("batch_id") or "",
-                "session_id": sid,
-            },
-            merge=True,
-        )
-        if not import_result.get("ok"):
-            raise RuntimeError(
-                f"SSO account import failed: {import_result.get('error')}; "
-                f"adapter_build={ADAPTER_BUILD}"
+            if not import_result.get("ok"):
+                raise RuntimeError(
+                    f"SSO account import failed: {import_result.get('error')}; "
+                    f"adapter_build={ADAPTER_BUILD}"
+                )
+        except _RegCancelled:
+            raise
+        except Exception as auth_exc:  # noqa: BLE001
+            _check_cancel()
+            _complete_sso_only_registration(
+                sess=sess,
+                email=email,
+                password=password,
+                sso=sso,
+                accounts=accounts,
+                update=update,
+                auth_error=auth_exc,
             )
+            return
         # Registration import is persisted in the local SQLite account store.
         imported_rows = [
             x for x in (import_result.get("imported") or []) if isinstance(x, dict)

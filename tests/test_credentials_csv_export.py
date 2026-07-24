@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
@@ -67,6 +69,53 @@ class CredentialsCsvExportTests(unittest.TestCase):
         self.assertIn("SELECT email, password FROM accounts", sql)
         self.assertNotIn("WHERE", sql.upper())
         self.assertNotIn("LIMIT", sql.upper())
+
+    def test_sso_only_account_remains_visible_and_exportable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            output_dir = data_dir / "outputs"
+            connections = []
+            original_connect = register_lite_store._connect
+
+            def tracked_connect():
+                connection = original_connect()
+                connections.append(connection)
+                return connection
+
+            with patch.multiple(
+                register_lite_store,
+                DATA_DIR=data_dir,
+                DB_PATH=data_dir / "register_lite.sqlite3",
+                OUTPUT_DIR=output_dir,
+                AUTH_MAP_DIR=output_dir / "grok2api_auth",
+                CPA_DIR=output_dir / "cpa_auth",
+                BACKUP_DIR=data_dir / "backups",
+            ), patch.object(register_lite_store, "_connect", side_effect=tracked_connect):
+                try:
+                    saved = register_lite_store.import_local_credentials(
+                        [
+                            {
+                                "email": "partial@example.test",
+                                "password": "secret-password",
+                                "sso": "sso-token",
+                            }
+                        ],
+                        source="registration_auth_partial",
+                    )
+                    listed = register_lite_store.list_accounts(page=1, page_size=10)
+                    sso_rows = register_lite_store.export_sso_rows(status=["sso_pending"])
+                finally:
+                    for connection in connections:
+                        connection.close()
+
+        self.assertTrue(saved["ok"])
+        self.assertEqual(saved["created"], 1)
+        self.assertEqual(listed["total"], 1)
+        self.assertEqual(listed["accounts"][0]["email"], "partial@example.test")
+        self.assertEqual(listed["accounts"][0]["status"], "sso_pending")
+        self.assertEqual(sso_rows[0]["email"], "partial@example.test")
+        self.assertEqual(sso_rows[0]["password"], "secret-password")
+        self.assertEqual(sso_rows[0]["sso"], "sso-token")
 
 
 if __name__ == "__main__":

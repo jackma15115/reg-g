@@ -1495,6 +1495,7 @@
                 <option value="active">可用</option>
                 <option value="relogged">已重登</option>
                 <option value="registered">已注册</option>
+                <option value="sso_pending">待授权</option>
                 <option value="credentials_only">仅密码</option>
                 <option value="probe_failed">测活失败</option>
                 <option value="failed">失败</option>
@@ -4685,7 +4686,7 @@
         var mode = value("grok2api_upload_mode") || "build_auth_files";
         if (mode === "web_sso") {
           window.location.href = __adminUrl("api", "accounts", "register-email", "export-sso") +
-            "?status=imported,registered,active&format=sso&download=1";
+            "?status=imported,registered,active,sso_pending&format=sso&download=1";
           return;
         }
         window.location.href = __adminUrl("api", "accounts", "register-email", "export-auth-zip") + "?limit=5000";
@@ -4693,7 +4694,7 @@
 
       function exportSsoAccounts() {
         window.location.href = __adminUrl("api", "accounts", "register-email", "export-sso") +
-          "?status=imported,registered,active&format=sso&download=1";
+          "?status=imported,registered,active,sso_pending&format=sso&download=1";
       }
 
       function exportCpaAccounts() {
